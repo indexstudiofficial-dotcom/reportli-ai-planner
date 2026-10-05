@@ -1,39 +1,13 @@
 // ============================================================
 // REPORTLI AI — PLANNER WORKER
 // ============================================================
-//
-// Manual test:
-//
-// POST /
-//
-// {
-//   "test": true
-// }
-//
-// Cloudflare Cron:
-// Runs every 30 minutes.
-//
-// Required secrets:
-//
-// SUPABASE_URL
-// SUPABASE_SERVICE_ROLE_KEY
-// SARVAM_API_KEY
-//
-// ============================================================
-
-
-// ============================================================
-// CONFIG
-// ============================================================
 
 const SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions";
 const SARVAM_MODEL = "sarvam-105b";
 
-const MAX_PLANS_PER_RUN = 5;
-const MIN_PLANS_PER_RUN = 3;
-
-const TASK_EXPIRY_HOURS = 24;
-
+// Maximum applications processed in ONE Worker invocation.
+// This prevents Cloudflare "Too many subrequests" errors.
+const BATCH_SIZE = 3;
 
 // ============================================================
 // CORS
@@ -44,48 +18,42 @@ function corsHeaders() {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
   };
 }
-
-
-// ============================================================
-// RESPONSE HELPERS
-// ============================================================
 
 function json(data, status = 200) {
-  return new Response(
-    JSON.stringify(data, null, 2),
-    {
-      status,
-      headers: corsHeaders()
-    }
-  );
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: corsHeaders(),
+  });
 }
 
-
 // ============================================================
-// SUPABASE REQUEST
+// SUPABASE
 // ============================================================
 
-async function supabaseRequest(env, path, options = {}) {
-  const url = `${env.SUPABASE_URL}${path}`;
+async function supabase(env, path, options = {}) {
+  if (!env.SUPABASE_URL) {
+    throw new Error("SUPABASE_URL is missing");
+  }
 
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-    "Prefer": options.prefer || "return=representation",
-    ...(options.headers || {})
-  };
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing");
+  }
 
-  const response = await fetch(url, {
-    method: options.method || "GET",
-    headers,
-    body: options.body
-      ? JSON.stringify(options.body)
-      : undefined
-  });
+  const response = await fetch(
+    `${env.SUPABASE_URL}${path}`,
+    {
+      ...options,
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+    }
+  );
 
   const text = await response.text();
 
@@ -100,9 +68,7 @@ async function supabaseRequest(env, path, options = {}) {
   if (!response.ok) {
     throw new Error(
       `Supabase ${response.status}: ${
-        typeof data === "string"
-          ? data
-          : JSON.stringify(data)
+        typeof data === "string" ? data : JSON.stringify(data)
       }`
     );
   }
@@ -110,246 +76,283 @@ async function supabaseRequest(env, path, options = {}) {
   return data;
 }
 
-
 // ============================================================
 // GET ACTIVE APPLICATIONS
 // ============================================================
 
 async function getActiveApplications(env) {
-  return await supabaseRequest(
+  return await supabase(
     env,
-    "/rest/v1/applications" +
-      "?status=eq.active" +
-      "&select=id,name,domain,company,user_id,status" +
-      "&order=created_at.asc"
+    "/rest/v1/applications?status=eq.active&select=id,name,domain,company,status,user_id&order=created_at.asc"
   );
 }
 
-
 // ============================================================
-// GET ONE APPLICATION
+// GET APPLICATION
 // ============================================================
 
 async function getApplication(env, applicationId) {
-  const data = await supabaseRequest(
+  const data = await supabase(
     env,
-    `/rest/v1/applications?id=eq.${encodeURIComponent(applicationId)}` +
-      `&select=id,name,domain,company,user_id,status`
+    `/rest/v1/applications?id=eq.${encodeURIComponent(
+      applicationId
+    )}&select=id,name,domain,company,status,user_id&limit=1`
   );
 
   return data?.[0] || null;
 }
 
-
 // ============================================================
 // GET CONNECTED INTEGRATIONS
 // ============================================================
 
-async function getIntegrations(env, applicationId) {
-  return await supabaseRequest(
+async function getConnectedIntegrations(env, applicationId) {
+  return await supabase(
     env,
-    `/rest/v1/user_integrations` +
-      `?application_id=eq.${encodeURIComponent(applicationId)}` +
-      `&status=eq.connected` +
-      `&select=integration_id,connection_id,account_name,account_email,status`
+    `/rest/v1/user_integrations?application_id=eq.${encodeURIComponent(
+      applicationId
+    )}&status=eq.connected&select=integration_id,account_name,account_email`
   );
 }
-
 
 // ============================================================
 // GET RECENT PLANNER RUNS
 // ============================================================
 
 async function getRecentRuns(env, applicationId) {
-  return await supabaseRequest(
+  return await supabase(
     env,
-    `/rest/v1/planner_runs` +
-      `?application_id=eq.${encodeURIComponent(applicationId)}` +
-      `&select=id,application_id,user_id,plan_date,plan_number,plan,tasks,result,status,error,created_at,completed_at` +
-      `&order=created_at.desc` +
-      `&limit=50`
+    `/rest/v1/planner_runs?application_id=eq.${encodeURIComponent(
+      applicationId
+    )}&select=id,plan_date,plan_number,plan,tasks,result,status,error,created_at,completed_at&order=created_at.desc&limit=20`
   );
 }
-
-
-// ============================================================
-// GET LAST 24 HOURS RUNS
-// ============================================================
-
-async function getRecent24HourRuns(env, applicationId) {
-  const since = new Date(
-    Date.now() - TASK_EXPIRY_HOURS * 60 * 60 * 1000
-  ).toISOString();
-
-  return await supabaseRequest(
-    env,
-    `/rest/v1/planner_runs` +
-      `?application_id=eq.${encodeURIComponent(applicationId)}` +
-      `&created_at=gte.${encodeURIComponent(since)}` +
-      `&select=id,plan_number,plan,tasks,result,status,created_at,completed_at` +
-      `&order=created_at.desc`
-  );
-}
-
 
 // ============================================================
 // CHECK IF APPLICATION HAS ANY PLANS
 // ============================================================
 
 async function hasAnyPlans(env, applicationId) {
-  const data = await supabaseRequest(
+  const data = await supabase(
     env,
-    `/rest/v1/planner_runs` +
-      `?application_id=eq.${encodeURIComponent(applicationId)}` +
-      `&select=id` +
-      `&limit=1`
+    `/rest/v1/planner_runs?application_id=eq.${encodeURIComponent(
+      applicationId
+    )}&select=id&limit=1`
   );
 
   return Array.isArray(data) && data.length > 0;
 }
 
-
 // ============================================================
 // GET TODAY'S PLANS
 // ============================================================
 
-async function getTodaysPlans(env, applicationId) {
+async function getTodayPlans(env, applicationId) {
   const today = new Date().toISOString().slice(0, 10);
 
-  return await supabaseRequest(
+  return await supabase(
     env,
-    `/rest/v1/planner_runs` +
-      `?application_id=eq.${encodeURIComponent(applicationId)}` +
-      `&plan_date=eq.${today}` +
-      `&select=id,plan_number,plan,tasks,result,status,created_at,completed_at` +
-      `&order=plan_number.asc`
+    `/rest/v1/planner_runs?application_id=eq.${encodeURIComponent(
+      applicationId
+    )}&plan_date=eq.${today}&select=id,plan_number,plan,tasks,result,status,created_at,completed_at&order=plan_number.asc`
   );
 }
 
+// ============================================================
+// GET COMPLETED PLANS OLDER THAN 24 HOURS
+// ============================================================
+//
+// IMPORTANT:
+// Do NOT query only the last 24 hours and then check for
+// records older than 24 hours. That can never work.
+//
+// We directly query:
+// created_at <= now - 24 hours
+// ============================================================
+
+async function getExpiredCompletedRuns(env, applicationId) {
+  const cutoff = new Date(
+    Date.now() - 24 * 60 * 60 * 1000
+  ).toISOString();
+
+  return await supabase(
+    env,
+    `/rest/v1/planner_runs?application_id=eq.${encodeURIComponent(
+      applicationId
+    )}&status=eq.completed&created_at=lte.${encodeURIComponent(
+      cutoff
+    )}&select=id,plan_date,plan_number,plan,tasks,result,status,created_at,completed_at&order=created_at.asc&limit=5`
+  );
+}
 
 // ============================================================
 // SAVE PLAN
 // ============================================================
 
-async function savePlan(env, application, planNumber, planData) {
+async function savePlan(env, applicationId, userId, plan, planNumber) {
   const today = new Date().toISOString().slice(0, 10);
 
-  const row = {
-    application_id: application.id,
-    user_id: application.user_id || null,
+  const payload = {
+    application_id: applicationId,
+    user_id: userId || null,
     plan_date: today,
     plan_number: planNumber,
-
-    plan: planData.plan || {},
-
-    tasks: planData.tasks || [],
-
+    plan: plan,
+    tasks: [
+      {
+        title: plan.title,
+        task_type: plan.task_type,
+        worker_type: plan.worker_type,
+        instruction: plan.instruction,
+        priority: plan.priority,
+        input_data: plan.input_data || {},
+        status: "pending",
+      },
+    ],
     result: null,
-
     status: "pending",
-
     error: null,
-
-    created_at: new Date().toISOString(),
-
-    completed_at: null
   };
 
-  const data = await supabaseRequest(
+  return await supabase(
     env,
     "/rest/v1/planner_runs",
     {
       method: "POST",
-      body: row,
-      prefer: "return=representation"
+      headers: {
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify(payload),
     }
   );
-
-  return data?.[0] || data;
 }
 
-
 // ============================================================
-// UPDATE PLAN
-// ============================================================
-
-async function updatePlan(env, id, updates) {
-  const data = await supabaseRequest(
-    env,
-    `/rest/v1/planner_runs?id=eq.${encodeURIComponent(id)}`,
-    {
-      method: "PATCH",
-      body: updates,
-      prefer: "return=representation"
-    }
-  );
-
-  return data?.[0] || data;
-}
-
-
-// ============================================================
-// BUILD INTEGRATION SUMMARY
+// INTEGRATION SUMMARY
 // ============================================================
 
 function buildIntegrationSummary(integrations) {
-  if (!integrations || integrations.length === 0) {
-    return {
-      connected: [],
-      available_workers: []
-    };
-  }
-
-  const connected = integrations.map(item => ({
-    integration_id: item.integration_id,
-    account_name: item.account_name || null,
-    account_email: item.account_email || null,
-    status: item.status
-  }));
-
-  const availableWorkers = [];
-
-  for (const item of integrations) {
-    const integration = item.integration_id;
-
-    if (integration === "apollo") {
-      availableWorkers.push("lead_generation");
-    }
-
-    if (integration === "reddit") {
-      availableWorkers.push("research");
-    }
-
-    if (integration === "gmail") {
-      availableWorkers.push("gmail");
-    }
-
-    if (
-      integration === "google-calendar" ||
-      integration === "google-meet"
-    ) {
-      availableWorkers.push("meetings");
-    }
-  }
+  const connected = new Set(
+    (integrations || []).map((x) =>
+      String(x.integration_id || "").toLowerCase()
+    )
+  );
 
   return {
-    connected,
-    available_workers: [...new Set(availableWorkers)]
+    apollo: connected.has("apollo"),
+    reddit: connected.has("reddit"),
+    gmail: connected.has("gmail"),
+    google_calendar:
+      connected.has("google-calendar") ||
+      connected.has("google_calendar"),
+    google_meet:
+      connected.has("google-meet") ||
+      connected.has("google_meet") ||
+      connected.has("googlemeet"),
   };
 }
 
+// ============================================================
+// SARVAM PROMPT
+// ============================================================
+
+function buildPlannerPrompt({
+  application,
+  integrations,
+  previousRuns,
+  todayPlans,
+  expiredRuns,
+}) {
+  const integrationSummary =
+    buildIntegrationSummary(integrations);
+
+  return `
+You are Reportli AI's CEO Planner.
+
+Create 3–5 practical plans that help achieve the company's goal.
+
+Rules:
+- Return ONLY valid JSON.
+- Use only connected integrations.
+- Apollo → lead_generation
+- Reddit → research
+- Gmail → gmail
+- Calendar/Meet → meetings
+- planner → analysis without integrations.
+- Never invent integrations.
+- Use past results and avoid repeated work.
+- If integrations are missing, use planner tasks.
+- Every plan must support the company's business objective.
+
+Company:
+${JSON.stringify(
+  {
+    name: application?.name || "",
+    domain: application?.domain || "",
+    company: application?.company || "",
+    status: application?.status || "",
+  },
+  null,
+  2
+)}
+
+Connected integrations:
+${JSON.stringify(integrationSummary, null, 2)}
+
+Previous plans/results:
+${JSON.stringify(previousRuns || [], null, 2)}
+
+Today's plans:
+${JSON.stringify(todayPlans || [], null, 2)}
+
+Completed plans older than 24 hours:
+${JSON.stringify(expiredRuns || [], null, 2)}
+
+Return exactly:
+
+{
+  "plans": [
+    {
+      "title": "string",
+      "objective": "string",
+      "worker_type": "planner | lead_generation | research | gmail | meetings",
+      "task_type": "string",
+      "instruction": "string",
+      "priority": 1,
+      "input_data": {}
+    }
+  ]
+}
+`;
+}
 
 // ============================================================
-// SARVAM AI
+// CALL SARVAM
 // ============================================================
 
-async function callSarvam(env, systemPrompt, userPrompt) {
+async function callSarvam(env, prompt) {
+  // ----------------------------------------------------------
+  // IMPORTANT:
+  // Cloudflare secrets can sometimes contain accidental
+  // whitespace/newlines. Trim it before sending.
+  // ----------------------------------------------------------
+
+  const apiKey = String(env.SARVAM_API_KEY || "").trim();
+
+  if (!apiKey) {
+    throw new Error(
+      "SARVAM_API_KEY is missing. Add it with: npx wrangler secret put SARVAM_API_KEY"
+    );
+  }
+
   const response = await fetch(SARVAM_URL, {
     method: "POST",
 
     headers: {
       "Content-Type": "application/json",
-      "api-key": env.SARVAM_API_KEY
+
+      // Sarvam authentication
+      "api-key": apiKey,
     },
 
     body: JSON.stringify({
@@ -357,17 +360,13 @@ async function callSarvam(env, systemPrompt, userPrompt) {
 
       messages: [
         {
-          role: "system",
-          content: systemPrompt
-        },
-        {
           role: "user",
-          content: userPrompt
-        }
+          content: prompt,
+        },
       ],
 
-      temperature: 0.2
-    })
+      temperature: 0.2,
+    }),
   });
 
   const text = await response.text();
@@ -384,7 +383,7 @@ async function callSarvam(env, systemPrompt, userPrompt) {
     data = JSON.parse(text);
   } catch {
     throw new Error(
-      "Sarvam returned invalid JSON response"
+      `Sarvam returned invalid JSON: ${text}`
     );
   }
 
@@ -393,22 +392,23 @@ async function callSarvam(env, systemPrompt, userPrompt) {
 
   if (!content) {
     throw new Error(
-      "Sarvam response did not contain message content"
+      `Sarvam returned no message content: ${JSON.stringify(
+        data
+      )}`
     );
   }
 
   return content;
 }
 
-
 // ============================================================
-// EXTRACT JSON FROM AI RESPONSE
+// PARSE SARVAM JSON
 // ============================================================
 
-function parseAIJson(content) {
+function parsePlannerJSON(content) {
   let cleaned = String(content).trim();
 
-  // Remove markdown code fences
+  // Remove markdown code fences if Sarvam adds them.
   cleaned = cleaned
     .replace(/^```json\s*/i, "")
     .replace(/^```\s*/i, "")
@@ -418,270 +418,187 @@ function parseAIJson(content) {
   try {
     return JSON.parse(cleaned);
   } catch {
-    // Try to extract the first JSON object
+    // Try extracting the JSON object.
     const start = cleaned.indexOf("{");
     const end = cleaned.lastIndexOf("}");
 
     if (start !== -1 && end !== -1 && end > start) {
-      const possibleJson =
-        cleaned.slice(start, end + 1);
-
-      try {
-        return JSON.parse(possibleJson);
-      } catch {
-        // Continue
-      }
+      return JSON.parse(
+        cleaned.slice(start, end + 1)
+      );
     }
 
     throw new Error(
-      "Could not parse Sarvam planner JSON"
+      `Could not parse Sarvam JSON: ${cleaned}`
     );
   }
 }
 
-
 // ============================================================
-// VALIDATE PLAN
+// VALIDATE PLANS
 // ============================================================
 
-function validatePlans(aiData, integrationSummary) {
-  if (!aiData || typeof aiData !== "object") {
-    throw new Error("Planner returned invalid data");
-  }
-
-  if (!Array.isArray(aiData.plans)) {
-    throw new Error("Planner response must contain plans[]");
-  }
-
-  if (
-    aiData.plans.length < MIN_PLANS_PER_RUN ||
-    aiData.plans.length > MAX_PLANS_PER_RUN
-  ) {
+function validatePlans(data) {
+  if (!data || !Array.isArray(data.plans)) {
     throw new Error(
-      `Planner must create ${MIN_PLANS_PER_RUN}-${MAX_PLANS_PER_RUN} plans`
+      "Sarvam response does not contain a plans array"
     );
   }
 
-  const allowedWorkers =
-    new Set(integrationSummary.available_workers);
-
-  const validPlans = [];
-
-  for (const plan of aiData.plans) {
-    if (!plan || typeof plan !== "object") {
-      continue;
-    }
-
-    const workerType =
-      String(plan.worker_type || "planner");
-
-    // Planner itself is always allowed.
-    if (
-      workerType !== "planner" &&
-      !allowedWorkers.has(workerType)
-    ) {
-      continue;
-    }
-
-    validPlans.push({
-      title: String(
-        plan.title || "Untitled plan"
-      ),
-
-      objective: String(
-        plan.objective || ""
-      ),
-
-      worker_type: workerType,
-
-      task_type: String(
-        plan.task_type || "general"
-      ),
-
-      instruction: String(
-        plan.instruction || plan.objective || ""
-      ),
-
-      priority:
-        Number.isFinite(Number(plan.priority))
-          ? Number(plan.priority)
-          : 5,
-
-      input_data:
-        plan.input_data &&
-        typeof plan.input_data === "object"
-          ? plan.input_data
-          : {}
-    });
-  }
-
-  if (
-    validPlans.length < MIN_PLANS_PER_RUN
-  ) {
+  if (data.plans.length < 3) {
     throw new Error(
-      "Planner did not return enough executable plans for the connected integrations"
+      `Sarvam returned only ${data.plans.length} plans. Minimum is 3.`
     );
   }
 
-  return validPlans.slice(
-    0,
-    MAX_PLANS_PER_RUN
-  );
+  if (data.plans.length > 5) {
+    data.plans = data.plans.slice(0, 5);
+  }
+
+  const allowedWorkers = new Set([
+    "planner",
+    "lead_generation",
+    "research",
+    "gmail",
+    "meetings",
+  ]);
+
+  for (const plan of data.plans) {
+    if (!plan.title) {
+      throw new Error("Plan is missing title");
+    }
+
+    if (!plan.instruction) {
+      throw new Error(
+        `Plan "${plan.title}" is missing instruction`
+      );
+    }
+
+    if (!allowedWorkers.has(plan.worker_type)) {
+      throw new Error(
+        `Unsupported worker_type: ${plan.worker_type}`
+      );
+    }
+  }
+
+  return data.plans;
 }
 
-
 // ============================================================
-// CREATE PLANS WITH AI
+// CHECK WORKER CONNECTION
 // ============================================================
 
-async function generatePlans(
-  env,
-  application,
-  integrations,
-  recentRuns,
-  reason
-) {
-  const integrationSummary =
+function workerIsAvailable(workerType, integrations) {
+  const summary =
     buildIntegrationSummary(integrations);
 
-  const systemPrompt = `
-You are Reportli AI's CEO Planner.
+  switch (workerType) {
+    case "apollo":
+    case "lead_generation":
+      return summary.apollo;
 
-Create 3–5 practical plans that help achieve the company's goal.
+    case "reddit":
+    case "research":
+      return summary.reddit;
 
-Rules:
-- Return ONLY valid JSON.
-- Use only connected integrations.
-- Apollo → lead_generation
-- Reddit → research
-- Gmail → gmail
-- Calendar/Meet → meetings
-- planner → analysis without integrations.
-- Never invent integrations.
-- Use past results and avoid repeated work.
-- If integrations are missing, use planner tasks.
+    case "gmail":
+      return summary.gmail;
 
-Return:
-{
-  "plans": [
-    {
-      "title": "string",
-      "objective": "string",
-      "worker_type": "planner | lead_generation | research | gmail | meetings",
-      "task_type": "string",
-      "instruction": "string",
-      "priority": 1,
-      "input_data": {}
-    }
-  ]
+    case "meetings":
+      return (
+        summary.google_calendar ||
+        summary.google_meet
+      );
+
+    case "planner":
+      return true;
+
+    default:
+      return false;
+  }
 }
-`;
 
-  const userPrompt = JSON.stringify({
-    reason,
+// ============================================================
+// FILTER PLANS BY CONNECTED INTEGRATIONS
+// ============================================================
 
-    application: {
-      id: application.id,
-      name: application.name,
-      domain: application.domain,
-      company: application.company,
-      status: application.status
-    },
-
-    connected_integrations:
-      integrationSummary.connected,
-
-    available_workers:
-      integrationSummary.available_workers,
-
-    previous_runs:
-      recentRuns.slice(0, 20)
-  });
-
-  const aiResponse = await callSarvam(
-    env,
-    systemPrompt,
-    userPrompt
-  );
-
-  const aiData =
-    parseAIJson(aiResponse);
-
-  const plans =
-    validatePlans(
-      aiData,
-      integrationSummary
+function filterPlans(plans, integrations) {
+  return plans.filter((plan) => {
+    return workerIsAvailable(
+      plan.worker_type,
+      integrations
     );
-
-  return plans;
+  });
 }
 
-
 // ============================================================
-// SAVE GENERATED PLANS
+// CREATE PLANS
 // ============================================================
 
-async function createPlansForApplication(
+async function createPlans(
   env,
   application,
   integrations,
-  reason
+  previousRuns,
+  todayPlans,
+  expiredRuns
 ) {
-  const recentRuns =
-    await getRecentRuns(
-      env,
-      application.id
-    );
+  const prompt = buildPlannerPrompt({
+    application,
+    integrations,
+    previousRuns,
+    todayPlans,
+    expiredRuns,
+  });
+
+  const content = await callSarvam(
+    env,
+    prompt
+  );
+
+  const parsed =
+    parsePlannerJSON(content);
 
   const plans =
-    await generatePlans(
-      env,
-      application,
-      integrations,
-      recentRuns,
-      reason
+    validatePlans(parsed);
+
+  const executablePlans =
+    filterPlans(
+      plans,
+      integrations
     );
+
+  // If Sarvam created plans requiring unavailable
+  // integrations, don't execute those plans.
+  if (executablePlans.length === 0) {
+    throw new Error(
+      "Sarvam returned no executable plans for the currently connected integrations"
+    );
+  }
+
+  const plansToSave =
+    executablePlans.slice(0, 5);
 
   const saved = [];
 
-  for (let i = 0; i < plans.length; i++) {
-    const plan = plans[i];
-
-    const planNumber = i + 1;
-
-    const savedPlan =
-      await savePlan(
-        env,
-        application,
-        planNumber,
-        {
-          plan: {
-            title: plan.title,
-            objective: plan.objective,
-            worker_type: plan.worker_type,
-            task_type: plan.task_type,
-            priority: plan.priority
-          },
-
-          tasks: [
-            {
-              worker_type: plan.worker_type,
-              task_type: plan.task_type,
-              instruction: plan.instruction,
-              priority: plan.priority,
-              input_data: plan.input_data,
-              status: "pending"
-            }
-          ]
-        }
-      );
+  for (let i = 0; i < plansToSave.length; i++) {
+    const savedPlan = await savePlan(
+      env,
+      application.id,
+      application.user_id,
+      plansToSave[i],
+      i + 1
+    );
 
     saved.push(savedPlan);
   }
 
-  return saved;
+  return {
+    generated: plans.length,
+    saved: saved.length,
+    plans: plansToSave,
+  };
 }
-
 
 // ============================================================
 // PROCESS ONE APPLICATION
@@ -689,371 +606,377 @@ async function createPlansForApplication(
 
 async function processApplication(
   env,
-  application,
-  reason = "scheduled"
+  application
 ) {
   const applicationId =
     application.id;
 
-  const integrations =
-    await getIntegrations(
-      env,
-      applicationId
-    );
+  try {
+    // --------------------------------------------------------
+    // Get integrations
+    // --------------------------------------------------------
 
-  const todaysPlans =
-    await getTodaysPlans(
-      env,
-      applicationId
-    );
-
-  const recent24 =
-    await getRecent24HourRuns(
-      env,
-      applicationId
-    );
-
-  const anyPlans =
-    await hasAnyPlans(
-      env,
-      applicationId
-    );
-
-  // ----------------------------------------------------------
-  // CASE 1:
-  // No plans have ever been created.
-  // ----------------------------------------------------------
-
-  if (!anyPlans) {
-    const created =
-      await createPlansForApplication(
+    const integrations =
+      await getConnectedIntegrations(
         env,
-        application,
-        integrations,
-        "No previous planner tasks exist for this application. Create the first 3-5 plans."
+        applicationId
       );
 
-    return {
-      application_id: applicationId,
-      action: "created_initial_plans",
-      plans_created: created.length
-    };
-  }
+    // --------------------------------------------------------
+    // Get history
+    // --------------------------------------------------------
 
-
-  // ----------------------------------------------------------
-  // CASE 2:
-  // Today already has 3-5 plans.
-  // Do not create duplicates every 30 minutes.
-  // ----------------------------------------------------------
-
-  if (
-    todaysPlans.length >= MIN_PLANS_PER_RUN
-  ) {
-    const hasActive =
-      todaysPlans.some(
-        item =>
-          item.status === "pending" ||
-          item.status === "running"
+    const previousRuns =
+      await getRecentRuns(
+        env,
+        applicationId
       );
 
-    const hasCompleted =
-      todaysPlans.some(
-        item =>
-          item.status === "completed"
+    const todayPlans =
+      await getTodayPlans(
+        env,
+        applicationId
       );
 
-    // If there are active tasks, leave them alone.
-    if (hasActive) {
+    // --------------------------------------------------------
+    // Find completed work older than 24 hours
+    // --------------------------------------------------------
+
+    const expiredRuns =
+      await getExpiredCompletedRuns(
+        env,
+        applicationId
+      );
+
+    // --------------------------------------------------------
+    // If there are no plans at all,
+    // create initial plans.
+    // --------------------------------------------------------
+
+    const anyPlans =
+      await hasAnyPlans(
+        env,
+        applicationId
+      );
+
+    // --------------------------------------------------------
+    // If today's plans already exist,
+    // don't create another set unnecessarily.
+    // --------------------------------------------------------
+
+    if (
+      anyPlans &&
+      todayPlans.length >= 3 &&
+      expiredRuns.length === 0
+    ) {
       return {
         application_id: applicationId,
-        action: "waiting_for_existing_tasks",
-        plans_today: todaysPlans.length
+        success: true,
+        skipped: true,
+        reason: "today_already_has_plans",
+        plans_today: todayPlans.length,
       };
     }
 
-    // If today's plans are completed,
-    // don't immediately create another batch.
-    if (hasCompleted) {
-      return {
-        application_id: applicationId,
-        action: "today_plans_completed",
-        plans_today: todaysPlans.length
-      };
-    }
-  }
+    // --------------------------------------------------------
+    // Create new plans
+    // --------------------------------------------------------
 
-
-  // ----------------------------------------------------------
-  // CASE 3:
-  // Existing work is older than 24 hours and completed.
-  // Create the next batch.
-  // ----------------------------------------------------------
-
-  const expiryTime =
-    Date.now() -
-    TASK_EXPIRY_HOURS *
-      60 *
-      60 *
-      1000;
-
-  const expiredCompleted =
-    recent24.filter(item => {
-      if (
-        item.status !== "completed"
-      ) {
-        return false;
-      }
-
-      if (!item.created_at) {
-        return false;
-      }
-
-      return (
-        new Date(item.created_at).getTime() <=
-        expiryTime
-      );
-    });
-
-  if (expiredCompleted.length > 0) {
-    const created =
-      await createPlansForApplication(
+    const result =
+      await createPlans(
         env,
         application,
         integrations,
-        "Previous completed work is older than 24 hours. Create the next 3-5 plans using previous results."
+        previousRuns,
+        todayPlans,
+        expiredRuns
       );
 
     return {
       application_id: applicationId,
-      action: "created_follow_up_plans",
-      expired_completed_tasks:
-        expiredCompleted.length,
-      plans_created: created.length
+      success: true,
+      skipped: false,
+      reason: anyPlans
+        ? expiredRuns.length > 0
+          ? "expired_work"
+          : "new_plans"
+        : "initial_plans",
+      connected_integrations:
+        integrations.map(
+          (x) => x.integration_id
+        ),
+      ...result,
     };
-  }
-
-
-  // ----------------------------------------------------------
-  // CASE 4:
-  // There are fewer than 3 plans today.
-  // Fill the missing plans.
-  // ----------------------------------------------------------
-
-  if (
-    todaysPlans.length < MIN_PLANS_PER_RUN
-  ) {
-    const created =
-      await createPlansForApplication(
-        env,
-        application,
-        integrations,
-        "The application has fewer than 3 plans for today. Create enough additional plans to maintain the daily minimum."
-      );
-
+  } catch (error) {
     return {
       application_id: applicationId,
-      action: "filled_missing_daily_plans",
-      existing_plans:
-        todaysPlans.length,
-      plans_created:
-        created.length
+      success: false,
+      error:
+        error?.message ||
+        String(error),
     };
   }
-
-
-  // ----------------------------------------------------------
-  // Nothing required.
-  // ----------------------------------------------------------
-
-  return {
-    application_id: applicationId,
-    action: "nothing_to_do",
-    plans_today: todaysPlans.length
-  };
 }
 
+// ============================================================
+// BATCH SELECTION
+// ============================================================
+//
+// We rotate batches based on the current 30-minute slot.
+//
+// Example with 15 applications and batch size 3:
+//
+// Slot 0 → apps 1–3
+// Slot 1 → apps 4–6
+// Slot 2 → apps 7–9
+// Slot 3 → apps 10–12
+// Slot 4 → apps 13–15
+// Slot 5 → apps 1–3 again
+//
+// This prevents all applications being processed in
+// one Worker invocation.
+// ============================================================
+
+function selectBatch(applications) {
+  if (
+    !Array.isArray(applications) ||
+    applications.length === 0
+  ) {
+    return [];
+  }
+
+  if (applications.length <= BATCH_SIZE) {
+    return applications;
+  }
+
+  const slots =
+    Math.ceil(
+      applications.length /
+        BATCH_SIZE
+    );
+
+  const now = Date.now();
+
+  const thirtyMinuteSlot =
+    Math.floor(
+      now / (30 * 60 * 1000)
+    );
+
+  const batchIndex =
+    thirtyMinuteSlot % slots;
+
+  const start =
+    batchIndex * BATCH_SIZE;
+
+  return applications.slice(
+    start,
+    start + BATCH_SIZE
+  );
+}
 
 // ============================================================
-// RUN ALL APPLICATIONS
+// RUN PLANNER
 // ============================================================
 
-async function runPlanner(env, reason) {
+async function runPlanner(env) {
+  // ----------------------------------------------------------
+  // Validate important secrets BEFORE doing database work.
+  // ----------------------------------------------------------
+
+  if (
+    !env.SARVAM_API_KEY ||
+    !String(env.SARVAM_API_KEY).trim()
+  ) {
+    throw new Error(
+      "SARVAM_API_KEY is missing. Run: npx wrangler secret put SARVAM_API_KEY"
+    );
+  }
+
   const applications =
-    await getActiveApplications(env);
+    await getActiveApplications(
+      env
+    );
+
+  const batch =
+    selectBatch(
+      applications
+    );
 
   const results = [];
 
-  for (const application of applications) {
-    try {
-      const result =
-        await processApplication(
-          env,
-          application,
-          reason
-        );
-
-      results.push({
-        ...result,
-        success: true
-      });
-
-    } catch (error) {
-      console.error(
-        `Planner failed for ${application.id}:`,
-        error
+  for (const application of batch) {
+    const result =
+      await processApplication(
+        env,
+        application
       );
 
-      results.push({
-        application_id:
-          application.id,
-
-        success: false,
-
-        error:
-          error instanceof Error
-            ? error.message
-            : String(error)
-      });
-    }
+    results.push(result);
   }
 
   return {
     success: true,
-    reason,
-    applications_checked:
+
+    applications_total:
       applications.length,
-    results
+
+    applications_checked:
+      batch.length,
+
+    batch_size:
+      BATCH_SIZE,
+
+    results,
   };
 }
 
-
 // ============================================================
-// WORKER
+// HTTP HANDLER
 // ============================================================
 
 export default {
-
-  // ==========================================================
-  // HTTP REQUEST
-  // ==========================================================
-
-  async fetch(request, env, ctx) {
-
+  async fetch(request, env) {
+    // --------------------------------------------------------
     // OPTIONS
+    // --------------------------------------------------------
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: corsHeaders()
+        headers: corsHeaders(),
       });
     }
 
+    // --------------------------------------------------------
+    // GET
+    // --------------------------------------------------------
 
-    // GET HEALTH CHECK
     if (request.method === "GET") {
       return json({
         success: true,
-        worker: "reportli-ai-planner",
-        status: "healthy",
-        schedule: "every 30 minutes"
+        worker:
+          "reportli-ai-planner",
+        status: "running",
+        batch_size:
+          BATCH_SIZE,
+        sarvam_configured:
+          !!(
+            env.SARVAM_API_KEY &&
+            String(
+              env.SARVAM_API_KEY
+            ).trim()
+          ),
+        time:
+          new Date().toISOString(),
       });
     }
 
+    // --------------------------------------------------------
+    // POST
+    // --------------------------------------------------------
 
-    // POST MANUAL TEST
     if (request.method === "POST") {
-
       let body = {};
 
       try {
-        body = await request.json();
+        const text =
+          await request.text();
+
+        if (text) {
+          body =
+            JSON.parse(text);
+        }
       } catch {
-        return json({
-          success: false,
-          error: "Invalid JSON body"
-        }, 400);
+        return json(
+          {
+            success: false,
+            error:
+              "Invalid JSON body",
+          },
+          400
+        );
       }
 
-
       // ------------------------------------------------------
-      // Manual test:
+      // Manual test
       //
+      // POST /
       // {
       //   "test": true
       // }
-      //
-      // No application_id required.
       // ------------------------------------------------------
 
       if (body.test === true) {
-
         try {
-
           const result =
             await runPlanner(
-              env,
-              "manual_test"
+              env
             );
 
           return json({
-            success: true,
+            ...result,
             mode: "test",
-            ...result
+            reason:
+              "manual_test",
           });
-
         } catch (error) {
-
-          return json({
-            success: false,
-            mode: "test",
-            error:
-              error instanceof Error
-                ? error.message
-                : String(error)
-          }, 500);
+          return json(
+            {
+              success: false,
+              mode: "test",
+              reason:
+                "manual_test",
+              error:
+                error?.message ||
+                String(error),
+            },
+            500
+          );
         }
       }
 
-
-      return json({
-        success: false,
-        error:
-          'Send { "test": true } to run a manual test.'
-      }, 400);
+      return json(
+        {
+          success: false,
+          error:
+            'Use POST / with {"test":true}',
+        },
+        400
+      );
     }
 
+    // --------------------------------------------------------
+    // METHOD NOT ALLOWED
+    // --------------------------------------------------------
 
-    return json({
-      success: false,
-      error: "Method not allowed"
-    }, 405);
+    return json(
+      {
+        success: false,
+        error:
+          "Method not allowed",
+      },
+      405
+    );
   },
-
 
   // ==========================================================
   // CLOUDFLARE CRON
   // ==========================================================
 
-  async scheduled(event, env, ctx) {
-
+  async scheduled(
+    controller,
+    env,
+    ctx
+  ) {
     ctx.waitUntil(
-      runPlanner(
-        env,
-        "scheduled_30_minute"
-      )
-        .then(result => {
-          console.log(
-            "Planner cron completed:",
-            JSON.stringify(result)
-          );
-        })
-        .catch(error => {
+      runPlanner(env).catch(
+        (error) => {
           console.error(
-            "Planner cron failed:",
+            "Scheduled planner error:",
             error
           );
-        })
+        }
+      )
     );
-  }
-
+  },
 };
