@@ -1,576 +1,436 @@
-// ============================================================
-// REPORTLI AI PLANNER
-// Version 4.0
-//
-// COMPANY PLANNER:
-// pending -> working -> completed / failed
-//
-// PLANNER_RUNS SOURCE:
-// reddit, apollo, system
-//
-// PLANNER_RUNS WORKER TYPE:
-// planner, research, lead_generation
-//
-// SCHEDULE:
-// Every 30 minutes.
-//
-// REDDIT / APOLLO:
-// - No AI used to generate tasks.
-// - At most one new plan per application per scheduled run.
-// - Do not create another plan while the latest plan has
-//   pending_count > 0.
-// - When an integration is disconnected, create a connection
-//   task instead.
-// ============================================================
+/**
+ * Reportli AI Planner — Cloudflare Worker
+ *
+ * Required secrets:
+ *   SUPABASE_URL
+ *   SUPABASE_SERVICE_ROLE_KEY
+ *   SARVAM_API_KEY
+ *
+ * Optional:
+ *   WEBHOOK_SECRET
+ *
+ * Cron: every 30 minutes.
+ */
 
+const SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions";
+const SARVAM_MODEL = "sarvam-105b";
 
-// ============================================================
-// 1. MAIN WORKER
-// ============================================================
+const NICHE_PERCENTAGES = [19, 16, 13, 11, 10, 9, 8, 6, 5, 3];
+const MAX_CONTEXT_CHARS = 8000;
+
+/* =========================================================
+   1. MAIN REQUEST HANDLER
+========================================================= */
 
 export default {
   async fetch(request, env, ctx) {
     const requestId = crypto.randomUUID();
 
-    try {
-      const url = new URL(request.url);
+    console.log("Incoming request", {
+      requestId,
+      method: request.method,
+    });
 
-      // Health check
+    try {
       if (request.method === "GET") {
         return jsonResponse({
-          success: true,
+          ok: true,
           worker: "reportli-ai-planner",
-          version: "4.0",
-          timestamp: new Date().toISOString()
+          version: "5.0-short-prompts",
+          time: new Date().toISOString(),
         });
       }
 
       if (request.method !== "POST") {
-        return jsonResponse({
-          success: false,
-          error: "Method not allowed"
-        }, 405);
+        return jsonResponse(
+          { error: "Method not allowed. Use GET or POST." },
+          405
+        );
       }
 
-      // Optional webhook authentication
       if (env.WEBHOOK_SECRET) {
-        const suppliedSecret =
-          request.headers.get("x-webhook-secret");
+        const supplied = request.headers.get("x-webhook-secret");
 
-        if (suppliedSecret !== env.WEBHOOK_SECRET) {
-          return jsonResponse({
-            success: false,
-            error: "Unauthorized"
-          }, 401);
+        if (supplied !== env.WEBHOOK_SECRET) {
+          return jsonResponse({ error: "Unauthorized" }, 401);
         }
       }
 
-      // Parse request body
-      const rawBody = await request.text();
+      const body = await request.json().catch(() => ({}));
 
-      let body = {};
-
-      if (rawBody.trim()) {
-        try {
-          body = JSON.parse(rawBody);
-        } catch {
-          return jsonResponse({
-            success: false,
-            error: "Invalid JSON request body"
-          }, 400);
-        }
-      }
-
-      console.log("Incoming request", {
-        requestId,
-        userAgent: request.headers.get("user-agent")
-      });
-
-      // Test Supabase
+      // Test Supabase connection.
       if (body.test_supabase === true) {
         const result = await testSupabase(env);
 
         return jsonResponse({
-          success: true,
+          ok: true,
           requestId,
-          ...result
+          supabase: result,
         });
       }
 
-      // Manually process an application
-      if (body.test_analysis === true) {
-        if (!body.application_id) {
-          return jsonResponse({
-            success: false,
-            error: "application_id is required"
-          }, 400);
-        }
+      // Run Reddit/Apollo planner manually.
+      if (body.run_research_planner === true) {
+        const result = await runScheduledResearchPlanner(env);
 
-        const result =
-          await processSpecificPendingApplication(
-            String(body.application_id),
-            env,
-            requestId
-          );
-
-        return jsonResponse(
-          result,
-          result.success ? 200 : 500
-        );
+        return jsonResponse({
+          ok: true,
+          requestId,
+          researchPlanner: result,
+        });
       }
 
-      // Normal webhook: check application queue
-      const result =
-        await processNextPendingApplication(
+      // Test company analysis for a specific application.
+      if (body.test_analysis === true && body.application_id) {
+        const result = await processSpecificApplication(
+          String(body.application_id),
           env,
-          requestId
+          true
         );
 
-      return jsonResponse(
-        result,
-        result.success ? 200 : 500
-      );
+        return jsonResponse({
+          ok: true,
+          requestId,
+          result,
+        });
+      }
 
+      // Process a specific application.
+      if (body.application_id) {
+        const result = await processSpecificApplication(
+          String(body.application_id),
+          env,
+          false
+        );
+
+        return jsonResponse({
+          ok: true,
+          requestId,
+          result,
+        });
+      }
+
+      // Otherwise, process the next pending application.
+      const result = await processNextPendingApplication(env);
+
+      return jsonResponse({
+        ok: true,
+        requestId,
+        result,
+      });
     } catch (error) {
       console.error("Request failed", {
         requestId,
-        message: error.message,
-        stack: error.stack
+        message: error?.message || String(error),
+        stack: error?.stack,
       });
 
-      return jsonResponse({
-        success: false,
-        requestId,
-        error: error.message
-      }, 500);
+      return jsonResponse(
+        {
+          ok: false,
+          requestId,
+          error: error?.message || String(error),
+        },
+        500
+      );
     }
   },
 
-
-  // Run every 30 minutes
+  // Runs automatically according to the cron schedule.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
-      runScheduledPlanner(env).catch(error => {
-        console.error("Scheduled planner failed", {
-          message: error.message,
-          stack: error.stack
-        });
+      runScheduledResearchPlanner(env).catch((error) => {
+        console.error(
+          "Scheduled research planner failed",
+          error?.message || error
+        );
       })
     );
-  }
+  },
 };
 
-
-// ============================================================
-// 2. JSON RESPONSE
-// ============================================================
+/* =========================================================
+   2. GENERAL HELPERS
+========================================================= */
 
 function jsonResponse(data, status = 200) {
-  return new Response(
-    JSON.stringify(data, null, 2),
-    {
-      status,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store"
-      }
-    }
-  );
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+    },
+  });
 }
-
-
-// ============================================================
-// 3. SUPABASE CONFIGURATION
-// ============================================================
 
 function getSupabaseConfig(env) {
-  if (!env.SUPABASE_URL) {
-    throw new Error("Missing SUPABASE_URL");
+  const url = (env.SUPABASE_URL || "").replace(/\/$/, "");
+  const key = env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+  if (!url || !key) {
+    throw new Error(
+      "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY secret."
+    );
   }
 
-  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
-  }
-
-  return {
-    url: env.SUPABASE_URL.replace(/\/+$/, ""),
-    key: env.SUPABASE_SERVICE_ROLE_KEY
-  };
+  return { url, key };
 }
 
-
-// ============================================================
-// 4. SUPABASE REQUEST HELPER
-// ============================================================
-
 async function supabaseRequest(env, path, options = {}) {
-  const config = getSupabaseConfig(env);
+  const { url, key } = getSupabaseConfig(env);
 
-  const response = await fetch(
-    `${config.url}/rest/v1/${path}`,
-    {
-      method: options.method || "GET",
+  const headers = new Headers(options.headers || {});
 
-      headers: {
-        apikey: config.key,
-        Authorization: `Bearer ${config.key}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
+  headers.set("apikey", key);
+  headers.set("authorization", `Bearer ${key}`);
+  headers.set("accept", "application/json");
 
-        ...(options.prefer
-          ? { Prefer: options.prefer }
-          : {})
-      },
+  if (options.body !== undefined) {
+    headers.set("content-type", "application/json");
+  }
 
-      ...(options.body !== undefined
-        ? {
-            body: JSON.stringify(options.body)
-          }
-        : {})
-    }
-  );
+  if (options.prefer) {
+    headers.set("prefer", options.prefer);
+  }
 
-  const text = await response.text();
+  const response = await fetch(`${url}/rest/v1/${path}`, {
+    method: options.method || "GET",
+    headers,
+    body:
+      options.body === undefined
+        ? undefined
+        : JSON.stringify(options.body),
+  });
+
+  const responseText = await response.text();
 
   let data = null;
 
-  if (text) {
+  if (responseText) {
     try {
-      data = JSON.parse(text);
+      data = JSON.parse(responseText);
     } catch {
-      data = text;
+      data = responseText;
     }
   }
 
   if (!response.ok) {
-    console.error("Supabase API error", {
-      path,
-      status: response.status,
-      response: data
-    });
+    const detail =
+      typeof data === "string"
+        ? data
+        : JSON.stringify(data);
 
     throw new Error(
-      `Supabase API error ${response.status}: ` +
-      `${typeof data === "string"
-        ? data
-        : JSON.stringify(data)}`
+      `Supabase ${options.method || "GET"} ${path} failed ` +
+      `(${response.status}): ${detail}`
     );
   }
 
   return data;
 }
 
-
-// ============================================================
-// 5. TEST SUPABASE
-// ============================================================
-
 async function testSupabase(env) {
   const rows = await supabaseRequest(
     env,
-    "applications?select=id,name,planner_status&limit=1"
+    "applications?select=id,name&limit=1"
   );
 
   return {
-    message: "Supabase connection successful",
-    rowsReturned: Array.isArray(rows)
-      ? rows.length
-      : 0
+    connected: true,
+    sampleRows: Array.isArray(rows) ? rows.length : 0,
   };
 }
 
+/* =========================================================
+   3. APPLICATION MANAGEMENT
+========================================================= */
 
-// ============================================================
-// 6. GET NEWEST PENDING APPLICATION
-// ============================================================
-
-async function getNewestPendingApplication(env) {
-  const query = new URLSearchParams({
-    select:
-      "id,name,api_key,status,user_id,created_at," +
-      "domain,company,planner_status",
-
-    planner_status: "eq.pending",
-
-    order: "created_at.desc.nullslast,id.desc",
-
-    limit: "1"
-  });
-
+async function getApplication(applicationId, env) {
   const rows = await supabaseRequest(
     env,
-    `applications?${query.toString()}`
+    `applications?select=id,name,api_key,status,user_id,domain,company,planner_status,created_at&id=eq.${encodeURIComponent(applicationId)}&limit=1`
   );
 
-  return Array.isArray(rows) && rows.length
-    ? rows[0]
-    : null;
+  return Array.isArray(rows) ? rows[0] || null : null;
 }
 
+async function getNextPendingApplication(env) {
+  const rows = await supabaseRequest(
+    env,
+    "applications?select=id,name,api_key,status,user_id,domain,company,planner_status,created_at&planner_status=eq.pending&order=created_at.asc&limit=1"
+  );
 
-// ============================================================
-// 7. CLAIM APPLICATION
-// ============================================================
+  return Array.isArray(rows) ? rows[0] || null : null;
+}
 
-async function claimApplication(applicationId, env) {
-  const query = new URLSearchParams({
-    id: `eq.${applicationId}`,
-
-    planner_status: "eq.pending",
-
-    select:
-      "id,name,api_key,status,user_id,created_at," +
-      "domain,company,planner_status"
-  });
+async function claimApplication(applicationId, env, force = false) {
+  const filter = force
+    ? `id=eq.${encodeURIComponent(applicationId)}`
+    : `id=eq.${encodeURIComponent(applicationId)}&planner_status=eq.pending`;
 
   const rows = await supabaseRequest(
     env,
-    `applications?${query.toString()}`,
+    `applications?${filter}`,
     {
       method: "PATCH",
-
+      prefer: "return=representation",
       body: {
-        planner_status: "working"
+        planner_status: "working",
       },
-
-      prefer: "return=representation"
     }
   );
 
-  if (!Array.isArray(rows) || rows.length !== 1) {
-    return null;
+  if (Array.isArray(rows) && rows.length) {
+    return rows[0];
   }
 
-  return rows[0];
-}
+  if (force) {
+    const app = await getApplication(applicationId, env);
 
-
-// ============================================================
-// 8. PROCESS NEXT PENDING APPLICATION
-// ============================================================
-
-async function processNextPendingApplication(
-  env,
-  requestId
-) {
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    const application =
-      await getNewestPendingApplication(env);
-
-    if (!application) {
-      return {
-        success: true,
-        requestId,
-        processed: false,
-        message: "No pending applications"
-      };
+    if (!app) {
+      throw new Error(`Application not found: ${applicationId}`);
     }
 
-    const claimed = await claimApplication(
-      application.id,
-      env
-    );
-
-    if (!claimed) {
-      continue;
-    }
-
-    return await processClaimedApplication(
-      claimed,
-      env,
-      requestId
-    );
+    return app;
   }
 
-  return {
-    success: true,
-    requestId,
-    processed: false,
-    message: "Application claim retry limit reached"
-  };
+  return null;
 }
 
+async function processNextPendingApplication(env) {
+  const app = await getNextPendingApplication(env);
 
-// ============================================================
-// 9. MANUAL APPLICATION PROCESSING
-// ============================================================
+  if (!app) {
+    return {
+      processed: false,
+      message: "No pending applications.",
+    };
+  }
 
-async function processSpecificPendingApplication(
+  return processSpecificApplication(app.id, env, false);
+}
+
+async function processSpecificApplication(
   applicationId,
   env,
-  requestId
+  force = false
 ) {
   const claimed = await claimApplication(
     applicationId,
-    env
+    env,
+    force
   );
 
   if (!claimed) {
     return {
-      success: false,
-      requestId,
-      applicationId,
-      error:
-        "Application not found, not pending, or already claimed"
+      processed: false,
+      application_id: applicationId,
+      message: "Application is not pending or is already claimed.",
     };
   }
 
-  return await processClaimedApplication(
-    claimed,
-    env,
-    requestId
-  );
+  return processClaimedApplication(claimed, env);
 }
 
+/* =========================================================
+   4. COMPANY PROCESSING
+========================================================= */
 
-// ============================================================
-// 10. PROCESS COMPANY
-//
-// Sarvam is used for company analysis and niche generation.
-// Reddit/Apollo recurring task planning does not use AI.
-// ============================================================
-
-async function processClaimedApplication(
-  application,
-  env,
-  requestId
-) {
-  const applicationId = application.id;
-
+async function processClaimedApplication(app, env) {
   let plannerRunId = null;
 
-  try {
-    const companyName =
-      String(application.name || "").trim() ||
-      "your company";
+  const task =
+    `Analyze the company and find 10 customer niches for ${app.name || "this application"}`;
 
-    // Create company planner record.
-    // Use existing database worker_type and source values.
+  try {
     const runRows = await supabaseRequest(
       env,
-      "planner_runs?select=id",
+      "planner_runs",
       {
         method: "POST",
-
+        prefer: "return=representation",
         body: {
-          application_id: applicationId,
-
-          user_id: application.user_id || null,
-
+          application_id: app.id,
+          user_id: app.user_id || null,
           worker_type: "planner",
-
           source: "system",
-
-          task:
-            `Analyze the company and find 10 customer niches ` +
-            `for ${companyName}`,
-
-          pending_count: 10,
-
+          task,
+          pending_count: 1,
           error: null,
-
-          started_at: new Date().toISOString()
         },
-
-        prefer: "return=representation"
       }
     );
 
-    if (Array.isArray(runRows) && runRows.length) {
-      plannerRunId = runRows[0].id;
-    }
+    plannerRunId = Array.isArray(runRows)
+      ? runRows[0]?.id || null
+      : null;
 
-    // 1. Analyze company
+    const context = await buildCompanyContext(app, env);
+
     const analysis = await analyzeCompany(
-      application,
+      app,
+      context,
       env
     );
 
-    // 2. Save company analysis
     await saveBusinessData(
-      applicationId,
+      env,
+      app.id,
       "company_analysis",
-      analysis,
-      env
+      analysis
     );
 
-    // 3. Generate short niche names
     const niches = await generateCustomerNiches(
-      application,
+      app,
       analysis,
       env
     );
 
-    // 4. Save exactly 10 niches and percentage scores
-    const saveResult = await saveCustomerNiches(
-      application,
-      niches,
+    await saveCustomerNiches(app, niches, env);
+
+    await updateApplicationStatus(
+      app.id,
+      "completed",
       env
     );
 
-    // 5. Verify saved active niches
-    const activeNiches = await getActiveNiches(
-      applicationId,
-      env
-    );
-
-    if (activeNiches.length !== 10) {
-      throw new Error(
-        `Expected 10 active niches, found ${activeNiches.length}`
-      );
-    }
-
-    const percentageTotal = activeNiches.reduce(
-      (total, niche) =>
-        total + Number(niche.buying_intention || 0),
-      0
-    );
-
-    if (percentageTotal !== 100) {
-      throw new Error(
-        `Niche buying_intention percentages total ` +
-        `${percentageTotal}, not 100`
-      );
-    }
-
-    // 6. Complete company planner run
     if (plannerRunId) {
       await updatePlannerRun(
         plannerRunId,
         {
           pending_count: 0,
-          error: null
+          error: null,
         },
         env
       );
     }
 
-    // 7. Complete application
-    await updateApplicationStatus(
-      applicationId,
-      "completed",
-      env
-    );
-
     return {
-      success: true,
-      requestId,
-      applicationId,
-      planner_status: "completed",
-      companyAnalysisSaved: true,
-      generatedNiches: niches.length,
-      insertedNiches: saveResult.inserted,
-      activeNiches: activeNiches.length,
-      buyingIntentionTotal: percentageTotal
+      processed: true,
+      application_id: app.id,
+      company_analysis_saved: true,
+      niches_saved: niches.length,
+      buying_intention_percentages: NICHE_PERCENTAGES,
     };
-
   } catch (error) {
+    const message = error?.message || String(error);
+
     console.error("Application processing failed", {
-      requestId,
-      applicationId,
-      message: error.message,
-      stack: error.stack
+      applicationId: app.id,
+      message,
     });
+
+    try {
+      await updateApplicationStatus(
+        app.id,
+        "failed",
+        env
+      );
+    } catch (statusError) {
+      console.error(
+        "Could not mark application failed",
+        statusError?.message || statusError
+      );
+    }
 
     if (plannerRunId) {
       try {
@@ -578,1200 +438,791 @@ async function processClaimedApplication(
           plannerRunId,
           {
             pending_count: 0,
-            error: String(
-              error.message || error
-            ).slice(0, 5000)
+            error: message.slice(0, 1500),
           },
           env
         );
-      } catch (loggingError) {
+      } catch (updateError) {
         console.error(
-          "Could not save planner error",
-          loggingError.message
+          "Could not update planner run",
+          updateError?.message || updateError
         );
       }
     }
 
-    try {
-      await updateApplicationStatus(
-        applicationId,
-        "failed",
-        env
-      );
-    } catch (statusError) {
-      console.error(
-        "Could not update application status",
-        statusError.message
-      );
-    }
-
-    return {
-      success: false,
-      requestId,
-      applicationId,
-      planner_status: "failed",
-      error: error.message
-    };
+    throw error;
   }
 }
-
-
-// ============================================================
-// 11. UPDATE APPLICATION STATUS
-// ============================================================
 
 async function updateApplicationStatus(
   applicationId,
   status,
   env
 ) {
-  const query = new URLSearchParams({
-    id: `eq.${applicationId}`,
-    select: "id,planner_status"
-  });
+  await supabaseRequest(
+    env,
+    `applications?id=eq.${encodeURIComponent(applicationId)}`,
+    {
+      method: "PATCH",
+      prefer: "return=minimal",
+      body: {
+        planner_status: status,
+      },
+    }
+  );
+}
+
+async function updatePlannerRun(runId, values, env) {
+  await supabaseRequest(
+    env,
+    `planner_runs?id=eq.${encodeURIComponent(runId)}`,
+    {
+      method: "PATCH",
+      prefer: "return=minimal",
+      body: values,
+    }
+  );
+}
+
+/* =========================================================
+   5. BUILD SHORT COMPANY CONTEXT
+========================================================= */
+
+async function buildCompanyContext(app, env) {
+  const pieces = [
+    app.name ? `Application name: ${app.name}` : "",
+    app.company ? `Company: ${app.company}` : "",
+    app.domain ? `Domain: ${app.domain}` : "",
+  ].filter(Boolean);
 
   const rows = await supabaseRequest(
     env,
-    `applications?${query.toString()}`,
-    {
-      method: "PATCH",
-
-      body: {
-        planner_status: status
-      },
-
-      prefer: "return=representation"
-    }
+    `business_data?select=field,data&application_id=eq.${encodeURIComponent(app.id)}&order=updated_at.desc&limit=20`
   );
 
-  if (!Array.isArray(rows) || rows.length !== 1) {
-    throw new Error(
-      `Failed to set application status to ${status}`
+  let remaining = MAX_CONTEXT_CHARS;
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || !row.data) continue;
+
+    const text = flattenText(row.data);
+
+    if (!text) continue;
+
+    const snippet = text.slice(
+      0,
+      Math.min(remaining, 1800)
     );
+
+    if (snippet) {
+      pieces.push(
+        `${row.field || "Company information"}: ${snippet}`
+      );
+    }
+
+    remaining -= snippet.length;
+
+    if (remaining <= 0) break;
   }
 
-  return rows[0];
+  return pieces.join("\n").slice(0, MAX_CONTEXT_CHARS);
 }
 
+function flattenText(value) {
+  if (typeof value === "string") {
+    return value;
+  }
 
-// ============================================================
-// 12. UPDATE PLANNER RUN
-// ============================================================
+  if (Array.isArray(value)) {
+    return value.map(flattenText).filter(Boolean).join("\n");
+  }
 
-async function updatePlannerRun(
-  plannerRunId,
-  updates,
-  env
-) {
-  const query = new URLSearchParams({
-    id: `eq.${plannerRunId}`,
-    select: "id"
-  });
+  if (value && typeof value === "object") {
+    const preferred = [
+      "text",
+      "content",
+      "title",
+      "description",
+      "summary",
+      "url",
+      "body",
+    ];
 
-  return await supabaseRequest(
-    env,
-    `planner_runs?${query.toString()}`,
-    {
-      method: "PATCH",
+    const values = [];
 
-      body: updates,
-
-      prefer: "return=representation"
+    for (const key of preferred) {
+      if (value[key] !== undefined) {
+        values.push(
+          `${key}: ${flattenText(value[key])}`
+        );
+      }
     }
-  );
+
+    if (!values.length) {
+      values.push(JSON.stringify(value));
+    }
+
+    return values.join("\n");
+  }
+
+  return value == null ? "" : String(value);
 }
 
-
-// ============================================================
-// 13. SARVAM API
-// ============================================================
+/* =========================================================
+   6. SARVAM API
+========================================================= */
 
 async function callSarvam(
   messages,
   env,
-  maxTokens = 4096
+  maxTokens = 900
 ) {
   if (!env.SARVAM_API_KEY) {
-    throw new Error("Missing SARVAM_API_KEY");
+    throw new Error("Missing SARVAM_API_KEY secret.");
   }
 
-  const controller = new AbortController();
+  const response = await fetch(SARVAM_API_URL, {
+    method: "POST",
+    headers: {
+      "api-subscription-key": env.SARVAM_API_KEY,
+      "content-type": "application/json",
+      "accept": "application/json",
+    },
+    body: JSON.stringify({
+      model: SARVAM_MODEL,
+      messages,
+      temperature: 0.2,
+      max_tokens: maxTokens,
+      response_format: {
+        type: "json_object",
+      },
+    }),
+  });
 
-  const timeout = setTimeout(
-    () => controller.abort(),
-    90000
-  );
+  const raw = await response.text();
 
-  let response;
-
-  try {
-    response = await fetch(
-      "https://api.sarvam.ai/v1/chat/completions",
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-          "api-subscription-key": env.SARVAM_API_KEY
-        },
-
-        body: JSON.stringify({
-          model: "sarvam-105b",
-          messages,
-          temperature: 0.2,
-          max_tokens: maxTokens,
-          response_format: {
-            type: "json_object"
-          }
-        }),
-
-        signal: controller.signal
-      }
-    );
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  const responseText = await response.text();
-
-  let data;
+  let result;
 
   try {
-    data = JSON.parse(responseText);
+    result = JSON.parse(raw);
   } catch {
     throw new Error(
-      "Sarvam returned invalid JSON: " +
-      responseText.slice(0, 1000)
+      `Sarvam returned invalid JSON (HTTP ${response.status}): ` +
+      raw.slice(0, 400)
     );
   }
 
   if (!response.ok) {
+    const message =
+      result?.error?.message ||
+      result?.message ||
+      raw.slice(0, 400);
+
     throw new Error(
-      `Sarvam API error ${response.status}: ` +
-      JSON.stringify(data).slice(0, 2000)
+      `Sarvam API error ${response.status}: ${message}`
     );
   }
 
-  const content =
-    data?.choices?.[0]?.message?.content;
+  let content = result?.choices?.[0]?.message?.content;
 
-  if (!content) {
-    throw new Error("Sarvam returned empty content");
+  if (Array.isArray(content)) {
+    content = content
+      .map((part) =>
+        typeof part === "string"
+          ? part
+          : part?.text || ""
+      )
+      .join("\n");
   }
 
-  return parseModelJson(content);
+  if (typeof content !== "string" || !content.trim()) {
+    throw new Error(
+      "Sarvam returned empty content. Response: " +
+      JSON.stringify(result).slice(0, 600)
+    );
+  }
+
+  return content.trim();
 }
 
-
-// ============================================================
-// 14. PARSE SARVAM JSON
-// ============================================================
-
 function parseModelJson(content) {
-  if (typeof content === "object" && content !== null) {
-    return content;
-  }
-
-  if (typeof content !== "string") {
-    throw new Error("Unexpected Sarvam response format");
-  }
-
   const cleaned = content
-    .trim()
     .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/, "");
+    .replace(/\s*```$/, "")
+    .trim();
 
   try {
     return JSON.parse(cleaned);
   } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+
+    if (start >= 0 && end > start) {
+      return JSON.parse(
+        cleaned.slice(start, end + 1)
+      );
+    }
+
     throw new Error(
-      "Could not parse Sarvam JSON: " +
-      cleaned.slice(0, 1500)
+      `Sarvam output was not valid JSON: ${cleaned.slice(0, 400)}`
     );
   }
 }
 
+/* =========================================================
+   7. SHORT COMPANY ANALYSIS PROMPT
+========================================================= */
 
-// ============================================================
-// 15. ANALYZE COMPANY
-// ============================================================
+async function analyzeCompany(app, context, env) {
+  const prompt =
+    `Analyze this company for customer discovery. ` +
+    `Use only supplied facts; do not invent facts. ` +
+    `Return JSON with keys: company_summary (string), ` +
+    `product_or_service (string), ideal_customer_types (array), ` +
+    `problems_solved (array). Keep values concise.\n\n` +
+    `Company facts:\n${context.slice(0, 6000)}`;
 
-async function analyzeCompany(application, env) {
-  const prompt = `
-Analyze this business using only the supplied information.
-
-Application name: ${application.name || ""}
-Website/domain: ${application.domain || ""}
-Company information: ${application.company || ""}
-
-Do not invent facts.
-Separate known facts from assumptions.
-Use null or empty arrays for missing information.
-
-Return valid JSON:
-
-{
-  "business_name": null,
-  "website": null,
-  "business_description": "",
-  "industry": null,
-  "products_or_services": [],
-  "target_customers": [],
-  "customer_problems": [],
-  "value_proposition": "",
-  "business_model": null,
-  "known_facts": [],
-  "assumptions": [],
-  "missing_information": []
-}
-`;
-
-  const result = await callSarvam(
+  const content = await callSarvam(
     [
       {
         role: "system",
         content:
-          "You are a careful business analyst. " +
-          "Return valid JSON and do not invent facts."
+          "You are a concise B2B market analyst. Return valid JSON only.",
       },
       {
         role: "user",
-        content: prompt
-      }
+        content: prompt,
+      },
     ],
     env,
-    4096
+    700
   );
 
-  if (
-    !result ||
-    typeof result !== "object" ||
-    Array.isArray(result)
-  ) {
-    throw new Error("Invalid company analysis response");
-  }
-
-  return result;
+  return parseModelJson(content);
 }
 
-
-// ============================================================
-// 16. SAVE BUSINESS DATA
-//
-// Requires UNIQUE(application_id, field).
-// ============================================================
-
-async function saveBusinessData(
-  applicationId,
-  field,
-  data,
-  env
-) {
-  const query = new URLSearchParams({
-    on_conflict: "application_id,field",
-    select: "application_id,field"
-  });
-
-  return await supabaseRequest(
-    env,
-    `business_data?${query.toString()}`,
-    {
-      method: "POST",
-
-      body: {
-        application_id: applicationId,
-        field,
-        data,
-        ai_status: "completed",
-        updated_at: new Date().toISOString()
-      },
-
-      prefer:
-        "resolution=merge-duplicates,return=representation"
-    }
-  );
-}
-
-
-// ============================================================
-// 17. GENERATE SHORT CUSTOMER NICHE NAMES
-//
-// Sarvam returns niche labels only.
-// Percentages are calculated locally in JavaScript.
-// ============================================================
+/* =========================================================
+   8. SHORT CUSTOMER NICHE GENERATION
+========================================================= */
 
 async function generateCustomerNiches(
-  application,
+  app,
   analysis,
   env
 ) {
-  const prompt = `
-Generate exactly 10 distinct potential customer niches
-for this business.
+  const companyFacts = JSON.stringify(analysis).slice(0, 3000);
 
-Company:
-${JSON.stringify({
-  name: application.name,
-  domain: application.domain,
-  company: application.company
-})}
+  const prompt =
+    `Generate exactly 10 distinct customer segment names. ` +
+    `Each name must be 1-4 words and identify WHO buys. ` +
+    `Examples: Freelancers, Website Agencies, SaaS Startups, ` +
+    `Recruitment Agencies. No sentences, strategies, outreach ` +
+    `methods, platforms, or near-duplicates. ` +
+    `Order highest to lowest estimated buying priority. ` +
+    `Return JSON only: {"niches":["Name 1","Name 2"]}. ` +
+    `Do not return scores or buying_intention.\n` +
+    `Company: ${app.name || "Unknown"}\n` +
+    `Facts: ${companyFacts}`;
 
-Company analysis:
-${JSON.stringify(analysis)}
-
-Generate exactly 10 distinct customer segment names, each 1–4 words (e.g., Freelancers, Website Agencies, SaaS Startups). Identify WHO the customers are, not their goals, strategies, or platforms. Avoid descriptions, duplicates, and near-duplicates. Order niches from highest to lowest estimated buying priority. Return JSON only, with no "buying_intention" values.
-
-Format:
-
-{
-  "niches": [
-    {
-      "niche_name": "Freelancers"
-    },
-    {
-      "niche_name": "Website Agencies"
-    }
-  ]
-}
-`;
-
-  const result = await callSarvam(
+  const content = await callSarvam(
     [
       {
         role: "system",
         content:
-          "You generate short customer segment labels. " +
-          "Return valid JSON only. Never write descriptions."
+          "Return valid JSON only. The niches array must contain exactly 10 short labels.",
       },
       {
         role: "user",
-        content: prompt
-      }
+        content: prompt,
+      },
     ],
     env,
-    4096
+    500
   );
 
-  if (!Array.isArray(result.niches)) {
-    throw new Error("Sarvam response has no niches array");
+  const parsed = parseModelJson(content);
+
+  const values = Array.isArray(parsed)
+    ? parsed
+    : parsed.niches;
+
+  if (!Array.isArray(values)) {
+    throw new Error(
+      "Sarvam niche output must contain a niches array."
+    );
   }
 
-  const unique = [];
+  const cleaned = [];
   const seen = new Set();
 
-  for (const item of result.niches) {
-    if (
-      !item ||
-      typeof item.niche_name !== "string"
-    ) {
-      continue;
+  for (const item of values) {
+    const rawName =
+      typeof item === "string"
+        ? item
+        : item?.niche_name || item?.name || "";
+
+    const name = cleanNicheName(rawName);
+
+    const key = name
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (name && !seen.has(key)) {
+      seen.add(key);
+      cleaned.push(name);
     }
-
-    const name = cleanNicheName(item.niche_name);
-
-    if (!name) {
-      continue;
-    }
-
-    if (name.split(/\s+/).length > 4) {
-      continue;
-    }
-
-    const normalized = normalizeNicheName(name);
-
-    if (seen.has(normalized)) {
-      continue;
-    }
-
-    seen.add(normalized);
-
-    unique.push({
-      niche_name: name
-    });
   }
 
-  if (unique.length < 10) {
+  if (cleaned.length < 10) {
     throw new Error(
-      `Only ${unique.length} unique short niches were generated. ` +
-      "Ten are required. Retry company planning."
+      `Sarvam returned only ${cleaned.length} distinct short niches; ` +
+      "expected 10. Check API credits and retry."
     );
   }
 
-  // Distinct percentages, descending, totaling exactly 100.
-  // These are relative priority shares, not verified
-  // probabilities of a purchase.
-  const percentages = [
-    19, 16, 13, 11, 10,
-     9,  8,  6,  5,  3
-  ];
-
-  return unique.slice(0, 10).map((niche, index) => ({
-    niche_name: niche.niche_name,
-    buying_intention: percentages[index]
-  }));
+  return cleaned.slice(0, 10).map(
+    (niche_name, index) => ({
+      niche_name,
+      buying_intention: NICHE_PERCENTAGES[index],
+    })
+  );
 }
-
-
-// ============================================================
-// 18. CLEAN NICHE NAME
-// ============================================================
 
 function cleanNicheName(value) {
-  let name = String(value || "")
-    .trim()
-    .replace(/^["']|["']$/g, "")
+  let name = String(value || "").trim();
+
+  name = name.replace(/^[-*\d.)\s]+/, "");
+
+  name = name.replace(
+    /\b(direct[- ]to[- ]consumer|brands?|companies|businesses|that want to|looking to|generating leads|attracting clients|on shopify|on linkedin|using linkedin|using shopify)\b/gi,
+    " "
+  );
+
+  name = name
+    .replace(/[,:;.!?()[\]{}]/g, " ")
     .replace(/\s+/g, " ")
-    .replace(/[.!?]+$/g, "");
-
-  // Remove generic marketing descriptions.
-  name = name.replace(
-    /^direct[-\s]?to[-\s]?consumer\s+/i,
-    ""
-  );
-
-  name = name.replace(
-    /\s+(on|using|through)\s+(shopify|linkedin|facebook|instagram|tiktok).*$/i,
-    ""
-  );
-
-  name = name.replace(
-    /\s+(generating leads|attracting clients|finding customers|looking for leads|by commenting|that want to|who want to).*$/i,
-    ""
-  );
-
-  // Remove common filler words.
-  const ignoredWords = new Set([
-    "and",
-    "the",
-    "for",
-    "with",
-    "that",
-    "who",
-    "on",
-    "in"
-  ]);
+    .trim();
 
   const words = name
-    .split(/\s+/)
+    .split(" ")
     .filter(Boolean)
-    .filter(word =>
-      !ignoredWords.has(word.toLowerCase())
-    );
+    .slice(0, 4);
 
-  // Keep labels short.
-  name = words.slice(0, 4).join(" ");
+  if (!words.length) return "";
 
-  return name.trim();
+  return words
+    .map(
+      (word) =>
+        word.charAt(0).toUpperCase() + word.slice(1)
+    )
+    .join(" ");
 }
 
+/* =========================================================
+   9. SAVE BUSINESS DATA
+========================================================= */
 
-// ============================================================
-// 19. NORMALIZE NICHE NAME
-// ============================================================
-
-function normalizeNicheName(value) {
-  return String(value)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-
-// ============================================================
-// 20. GET ACTIVE NICHES
-// ============================================================
-
-async function getActiveNiches(applicationId, env) {
-  const query = new URLSearchParams({
-    select:
-      "id,application_id,niche_name,buying_intention," +
-      "niche_status,user_id,created_at",
-
-    application_id: `eq.${applicationId}`,
-
-    niche_status: "eq.active",
-
-    order: "created_at.asc"
-  });
-
-  const rows = await supabaseRequest(
-    env,
-    `customer_niches?${query.toString()}`
-  );
-
-  return Array.isArray(rows) ? rows : [];
-}
-
-
-// ============================================================
-// 21. SAVE CUSTOMER NICHES
-//
-// The active set is replaced if it does not contain exactly
-// 10 short labels with 10 distinct percentages totaling 100.
-//
-// Old active niches are marked inactive rather than deleted.
-// ============================================================
-
-async function saveCustomerNiches(
-  application,
-  generatedNiches,
-  env
+async function saveBusinessData(
+  env,
+  applicationId,
+  field,
+  data
 ) {
-  const existing = await getActiveNiches(
-    application.id,
-    env
-  );
+  const query =
+    `business_data?select=id&application_id=eq.${encodeURIComponent(applicationId)}` +
+    `&field=eq.${encodeURIComponent(field)}&limit=1`;
 
-  const existingPercentages = existing.map(row =>
-    Number(row.buying_intention)
-  );
+  const existing = await supabaseRequest(env, query);
 
-  const existingPercentageTotal =
-    existingPercentages.reduce(
-      (sum, value) => sum + value,
-      0
-    );
+  const payload = {
+    application_id: applicationId,
+    field,
+    data,
+    updated_at: new Date().toISOString(),
+  };
 
-  const existingNamesAreShort = existing.every(row =>
-    String(row.niche_name || "")
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean)
-      .length <= 4
-  );
-
-  const existingPercentagesAreUnique =
-    new Set(existingPercentages).size === 10;
-
-  const existingIsValid =
-    existing.length === 10 &&
-    existingNamesAreShort &&
-    existingPercentagesAreUnique &&
-    existingPercentageTotal === 100;
-
-  if (existingIsValid) {
-    return {
-      existing: existing.length,
-      inserted: 0,
-      preserved: true
-    };
-  }
-
-  // Mark previous active niches inactive.
-  if (existing.length > 0) {
-    const query = new URLSearchParams({
-      application_id: `eq.${application.id}`,
-      niche_status: "eq.active",
-      select: "id"
-    });
-
+  if (
+    Array.isArray(existing) &&
+    existing.length &&
+    existing[0].id
+  ) {
     await supabaseRequest(
       env,
-      `customer_niches?${query.toString()}`,
+      `business_data?id=eq.${encodeURIComponent(existing[0].id)}`,
       {
         method: "PATCH",
-
-        body: {
-          niche_status: "inactive",
-          updated_at: new Date().toISOString()
-        },
-
-        prefer: "return=representation"
+        prefer: "return=minimal",
+        body: payload,
+      }
+    );
+  } else {
+    // POST avoids depending on a unique constraint.
+    await supabaseRequest(
+      env,
+      "business_data",
+      {
+        method: "POST",
+        prefer: "return=minimal",
+        body: payload,
       }
     );
   }
+}
 
-  if (generatedNiches.length !== 10) {
+/* =========================================================
+   10. SAVE CUSTOMER NICHES AND PERCENTAGES
+========================================================= */
+
+async function saveCustomerNiches(app, niches, env) {
+  if (!Array.isArray(niches) || niches.length !== 10) {
     throw new Error(
-      "Exactly 10 niches are required before saving"
+      "Exactly 10 niches are required before saving."
     );
   }
 
-  const rowsToInsert = generatedNiches.map(niche => ({
-    application_id: application.id,
+  const total = niches.reduce(
+    (sum, niche) => sum + Number(niche.buying_intention),
+    0
+  );
 
-    user_id: application.user_id || null,
+  const distinctPercentages = new Set(
+    niches.map((niche) => niche.buying_intention)
+  );
 
+  if (
+    total !== 100 ||
+    distinctPercentages.size !== 10
+  ) {
+    throw new Error(
+      "Niche percentages must be distinct and sum to 100."
+    );
+  }
+
+  // Deactivate old active niches while preserving history.
+  await supabaseRequest(
+    env,
+    `customer_niches?application_id=eq.${encodeURIComponent(app.id)}&niche_status=eq.active`,
+    {
+      method: "PATCH",
+      prefer: "return=minimal",
+      body: {
+        niche_status: "inactive",
+        updated_at: new Date().toISOString(),
+      },
+    }
+  );
+
+  const rows = niches.map((niche) => ({
+    application_id: app.id,
+    user_id: app.user_id || null,
     niche_name: niche.niche_name,
-
     buying_intention: niche.buying_intention,
-
     niche_status: "active",
-
-    created_at: new Date().toISOString(),
-
-    updated_at: new Date().toISOString()
   }));
 
   await supabaseRequest(
     env,
-    "customer_niches?select=id,niche_name,buying_intention,niche_status",
+    "customer_niches",
     {
       method: "POST",
-
-      body: rowsToInsert,
-
-      prefer: "return=representation"
+      prefer: "return=representation",
+      body: rows,
     }
   );
-
-  return {
-    existing: existing.length,
-    inserted: rowsToInsert.length,
-    preserved: false
-  };
 }
 
+/* =========================================================
+   11. REDDIT AND APOLLO INTEGRATIONS
+========================================================= */
 
-// ============================================================
-// 22. GET COMPLETED APPLICATIONS
-// ============================================================
-
-async function getEligibleApplications(env) {
-  const query = new URLSearchParams({
-    select:
-      "id,name,user_id,domain,company,planner_status",
-
-    planner_status: "eq.completed",
-
-    order: "created_at.asc",
-
-    limit: "100"
-  });
-
+async function getActiveNiches(applicationId, env) {
   const rows = await supabaseRequest(
     env,
-    `applications?${query.toString()}`
+    `customer_niches?select=id,niche_name,buying_intention&application_id=eq.${encodeURIComponent(applicationId)}&niche_status=eq.active&order=buying_intention.desc&limit=20`
   );
 
   return Array.isArray(rows) ? rows : [];
 }
 
-
-// ============================================================
-// 23. CHECK USER INTEGRATION
-//
-// Expected user_integrations fields:
-// application_id
-// integration_id
-// status
-//
-// Reddit integration_id = reddit
-// Apollo integration_id = apollo
-// Connected status = connected
-// ============================================================
-
-async function isIntegrationConnected(
+async function getIntegrationConnected(
   applicationId,
   integrationId,
   env
 ) {
-  const query = new URLSearchParams({
-    select: "id,integration_id,status",
-
-    application_id: `eq.${applicationId}`,
-
-    integration_id: `eq.${integrationId}`,
-
-    status: "eq.connected",
-
-    limit: "1"
-  });
-
   const rows = await supabaseRequest(
     env,
-    `user_integrations?${query.toString()}`
+    `user_integrations?select=id,status,integration_id&application_id=eq.${encodeURIComponent(applicationId)}&integration_id=eq.${encodeURIComponent(integrationId)}&status=eq.connected&limit=1`
   );
 
   return Array.isArray(rows) && rows.length > 0;
 }
-
-
-// ============================================================
-// 24. GET LATEST PLAN FOR A SOURCE
-//
-// Checks the latest planner run for the application/source.
-// The pending_count value controls whether another plan
-// may be created.
-// ============================================================
 
 async function getLatestPlan(
   applicationId,
   source,
   env
 ) {
-  const query = new URLSearchParams({
-    select:
-      "id,application_id,worker_type,source," +
-      "pending_count,task,created_at",
-
-    application_id: `eq.${applicationId}`,
-
-    source: `eq.${source}`,
-
-    order: "created_at.desc",
-
-    limit: "1"
-  });
-
   const rows = await supabaseRequest(
     env,
-    `planner_runs?${query.toString()}`
+    `planner_runs?select=id,application_id,worker_type,source,task,pending_count,created_at&application_id=eq.${encodeURIComponent(applicationId)}&source=eq.${encodeURIComponent(source)}&order=created_at.desc&limit=1`
   );
 
-  return Array.isArray(rows) && rows.length
-    ? rows[0]
-    : null;
+  return Array.isArray(rows) ? rows[0] || null : null;
 }
 
-
-// ============================================================
-// 25. DETECT CONNECTION TASK
-// ============================================================
-
-function isConnectionTask(task, integrationId) {
-  if (typeof task !== "string") {
-    return false;
-  }
-
-  const text = task.toLowerCase();
-
-  if (integrationId === "reddit") {
-    return text.includes("connect reddit");
-  }
-
-  if (integrationId === "apollo") {
-    return text.includes("connect apollo");
-  }
-
-  return false;
-}
-
-
-// ============================================================
-// 26. CREATE REDDIT OR APOLLO TASK
-//
-// No AI calls are used in this section.
-// ============================================================
-
-async function createSourcePlan(
-  application,
+async function createPlannerRun(
+  app,
+  workerType,
   source,
+  task,
   env
 ) {
-  const isReddit = source === "reddit";
-
-  const integrationId = isReddit
-    ? "reddit"
-    : "apollo";
-
-  const workerType = isReddit
-    ? "research"
-    : "lead_generation";
-
-  const connected = await isIntegrationConnected(
-    application.id,
-    integrationId,
-    env
-  );
-
-  const latest = await getLatestPlan(
-    application.id,
-    source,
-    env
-  );
-
-  // ----------------------------------------------------------
-  // CASE A: Integration is NOT connected.
-  // Create a connection task or keep the existing active task.
-  // ----------------------------------------------------------
-
-  if (!connected) {
-    const connectionTask = isReddit
-      ? "Connect Reddit to run your research agent"
-      : "Connect Apollo to run your outreach agent";
-
-    if (latest && Number(latest.pending_count) !== 0) {
-      // There is already an active plan.
-      // If it isn't a connection task, replace its task text
-      // rather than creating a duplicate planner run.
-      if (!isConnectionTask(latest.task, integrationId)) {
-        await updatePlannerRun(
-          latest.id,
-          {
-            task: connectionTask,
-            error: null
-          },
-          env
-        );
-
-        return {
-          created: false,
-          updated: true,
-          source,
-          message: connectionTask
-        };
-      }
-
-      // Connection task already exists and remains pending.
-      return {
-        created: false,
-        source,
-        message: "Connection task already pending"
-      };
-    }
-
-    // No active plan, or the latest plan has pending_count=0.
-    await insertPlannerRun(
-      application,
-      {
-        worker_type: workerType,
-        source,
-        task: connectionTask,
-        pending_count: 1,
-        niche_id: null
-      },
-      env
-    );
-
-    return {
-      created: true,
-      source,
-      task: connectionTask,
-      integrationConnected: false
-    };
-  }
-
-  // ----------------------------------------------------------
-  // CASE B: Integration IS connected.
-  // ----------------------------------------------------------
-
-  if (latest && Number(latest.pending_count) !== 0) {
-    if (isConnectionTask(latest.task, integrationId)) {
-      // The user has now connected the integration.
-      // Close the old connection task before creating a
-      // normal task. This keeps only one active plan per source.
-      await updatePlannerRun(
-        latest.id,
-        {
-          pending_count: 0,
-          error: null
-        },
-        env
-      );
-    } else {
-      // A normal task is still pending.
-      return {
-        created: false,
-        source,
-        message: "A plan for this source is already pending"
-      };
-    }
-  }
-
-  // Create one normal plan without using AI.
-  if (isReddit) {
-    const task = await buildRedditTask(
-      application,
-      env
-    );
-
-    await insertPlannerRun(
-      application,
-      {
-        worker_type: "research",
-        source: "reddit",
-        task: JSON.stringify(task),
-        pending_count: 1,
-        niche_id: null
-      },
-      env
-    );
-
-    return {
-      created: true,
-      source: "reddit",
-      taskId: task.task_id,
-      integrationConnected: true
-    };
-  }
-
-  const apolloTask = await buildApolloTask(
-    application,
-    env
-  );
-
-  await insertPlannerRun(
-    application,
-    {
-      worker_type: "lead_generation",
-      source: "apollo",
-      task: JSON.stringify(apolloTask),
-      pending_count: 1,
-      niche_id: null
-    },
-    env
-  );
-
-  return {
-    created: true,
-    source: "apollo",
-    taskId: apolloTask.task_id,
-    integrationConnected: true
-  };
-}
-
-
-// ============================================================
-// 27. INSERT PLANNER RUN
-// ============================================================
-
-async function insertPlannerRun(
-  application,
-  plan,
-  env
-) {
-  const body = {
-    application_id: application.id,
-
-    user_id: application.user_id || null,
-
-    worker_type: plan.worker_type,
-
-    source: plan.source,
-
-    task: plan.task,
-
-    pending_count: plan.pending_count,
-
-    error: null
-  };
-
-  if (plan.niche_id) {
-    body.niche_id = plan.niche_id;
-  }
-
   const rows = await supabaseRequest(
     env,
-    "planner_runs?select=id,source,worker_type,pending_count",
+    "planner_runs",
     {
       method: "POST",
-
-      body,
-
-      prefer: "return=representation"
+      prefer: "return=representation",
+      body: {
+        application_id: app.id,
+        user_id: app.user_id || null,
+        worker_type: workerType,
+        source,
+        task,
+        pending_count: 1,
+        error: null,
+      },
     }
   );
 
-  return Array.isArray(rows) && rows.length
-    ? rows[0]
-    : null;
+  return Array.isArray(rows) ? rows[0] || null : null;
 }
 
+/* =========================================================
+   12. SCHEDULED REDDIT/APOLLO PLANNER
+========================================================= */
 
-// ============================================================
-// 28. BUILD REDDIT TASK
-//
-// Uses stored company/niche data.
-// No AI calls.
-// ============================================================
-
-async function buildRedditTask(
-  application,
-  env
-) {
-  const niches = await getActiveNiches(
-    application.id,
-    env
+async function runScheduledResearchPlanner(env) {
+  const apps = await supabaseRequest(
+    env,
+    "applications?select=id,name,user_id,domain,company,planner_status,created_at&order=created_at.asc&limit=100"
   );
 
-  const taskId =
-    "research_" +
-    Date.now() +
-    "_" +
-    crypto.randomUUID().slice(0, 8);
-
-  return {
-    task_id: taskId,
-
-    application_id: application.id,
-
-    worker: "reddit_research",
-
-    objective:
-      "Research recent Reddit discussions to find " +
-      "customer problems, buying signals, and " +
-      "opportunities relevant to this company's niches.",
-
-    company: {
-      name: application.name || null,
-      domain: application.domain || null,
-      description: application.company || null
-    },
-
-    target_niches: niches.map(niche => ({
-      niche_id: niche.id,
-      niche_name: niche.niche_name,
-      buying_intention: niche.buying_intention
-    })),
-
-    research_sources: ["Reddit"],
-
-    subreddits: [
-      "SaaS",
-      "Entrepreneur",
-      "startups",
-      "indiehackers",
-      "sales"
-    ],
-
-    published_within_days: 7,
-
-    target_new_posts: 20,
-
-    created_at: new Date().toISOString()
+  const summary = {
+    applications_checked: 0,
+    plans_created: 0,
+    plans_updated: 0,
+    skipped: 0,
+    errors: [],
   };
-}
 
+  for (const app of Array.isArray(apps) ? apps : []) {
+    summary.applications_checked++;
 
-// ============================================================
-// 29. BUILD APOLLO TASK
-//
-// Uses stored company/niche data.
-// No AI calls.
-// ============================================================
-
-async function buildApolloTask(
-  application,
-  env
-) {
-  const niches = await getActiveNiches(
-    application.id,
-    env
-  );
-
-  const taskId =
-    "leadgen_" +
-    Date.now() +
-    "_" +
-    crypto.randomUUID().slice(0, 8);
-
-  return {
-    task_id: taskId,
-
-    application_id: application.id,
-
-    worker: "apollo_lead_generation",
-
-    objective:
-      "Find and qualify potential business leads matching " +
-      "the company's highest-priority customer niches.",
-
-    company: {
-      name: application.name || null,
-      domain: application.domain || null,
-      description: application.company || null
-    },
-
-    target_niches: niches.map(niche => ({
-      niche_id: niche.id,
-      niche_name: niche.niche_name,
-      buying_intention: niche.buying_intention
-    })),
-
-    lead_requirements: {
-      prioritize_highest_buying_intention: true,
-      require_relevant_company: true,
-      require_relevant_contact: true,
-      avoid_duplicate_leads: true
-    },
-
-    created_at: new Date().toISOString()
-  };
-}
-
-
-// ============================================================
-// 30. SCHEDULED PLANNER
-//
-// Runs every 30 minutes.
-//
-// For each completed application:
-// 1. Check Reddit.
-// 2. If no new Reddit plan can be created, check Apollo.
-// 3. Create at most ONE new plan per application per run.
-//
-// A source with pending_count > 0 is considered active.
-// A source with pending_count = 0 may receive another plan.
-// ============================================================
-
-async function runScheduledPlanner(env) {
-  console.log("Scheduled planner started");
-
-  const applications = await getEligibleApplications(env);
-
-  let plansCreated = 0;
-  let plansUpdated = 0;
-
-  for (const application of applications) {
     try {
-      // Prioritize Reddit. If a new Reddit plan is created,
-      // do not create an Apollo plan for this application
-      // in the same scheduled run.
-      const redditResult = await createSourcePlan(
-        application,
-        "reddit",
-        env
-      );
+      const niches = await getActiveNiches(app.id, env);
 
-      if (redditResult.created) {
-        plansCreated++;
-
-        console.log("Reddit plan created", {
-          applicationId: application.id,
-          result: redditResult
-        });
-
+      if (!niches.length) {
+        summary.skipped++;
         continue;
       }
 
-      if (redditResult.updated) {
-        plansUpdated++;
-      }
-
-      // Reddit has an active plan or no new Reddit plan
-      // was created. Check Apollo next.
-      const apolloResult = await createSourcePlan(
-        application,
-        "apollo",
+      // Reddit is checked first.
+      const redditAction = await tryCreateSourcePlan(
+        app,
+        "reddit",
+        niches,
         env
       );
 
-      if (apolloResult.created) {
-        plansCreated++;
-
-        console.log("Apollo plan created", {
-          applicationId: application.id,
-          result: apolloResult
-        });
+      if (redditAction === "created") {
+        summary.plans_created++;
+        continue;
       }
 
-      if (apolloResult.updated) {
-        plansUpdated++;
+      if (redditAction === "updated") {
+        summary.plans_updated++;
+        continue;
       }
 
+      // If Reddit already has an active task, don't duplicate it.
+      if (redditAction === "blocked") {
+        summary.skipped++;
+        continue;
+      }
+
+      // If Reddit has no eligible task, check Apollo.
+      const apolloAction = await tryCreateSourcePlan(
+        app,
+        "apollo",
+        niches,
+        env
+      );
+
+      if (apolloAction === "created") {
+        summary.plans_created++;
+      } else if (apolloAction === "updated") {
+        summary.plans_updated++;
+      } else {
+        summary.skipped++;
+      }
     } catch (error) {
-      console.error("Scheduled application failed", {
-        applicationId: application.id,
-        message: error.message,
-        stack: error.stack
+      summary.errors.push({
+        application_id: app.id,
+        error: (
+          error?.message || String(error)
+        ).slice(0, 500),
+      });
+
+      console.error("Research planner app failed", {
+        applicationId: app.id,
+        message: error?.message || String(error),
       });
     }
   }
 
-  console.log("Scheduled planner finished", {
-    applicationsChecked: applications.length,
-    plansCreated,
-    plansUpdated
-  });
+  return summary;
+}
+
+async function tryCreateSourcePlan(
+  app,
+  source,
+  niches,
+  env
+) {
+  const integrationConnected =
+    await getIntegrationConnected(
+      app.id,
+      source,
+      env
+    );
+
+  const latest = await getLatestPlan(
+    app.id,
+    source,
+    env
+  );
+
+  const connectTask =
+    source === "reddit"
+      ? "Connect Reddit to run your research agent"
+      : "Connect Apollo to run your outreach agent";
+
+  // Don't create another plan if the latest one is still pending.
+  if (latest && Number(latest.pending_count) > 0) {
+    const wasConnectTask = latest.task === connectTask;
+
+    if (!integrationConnected) {
+      if (latest.task !== connectTask) {
+        await updatePlannerRun(
+          latest.id,
+          { task: connectTask },
+          env
+        );
+
+        return "updated";
       }
+
+      return "blocked";
+    }
+
+    if (!wasConnectTask) {
+      return "blocked";
+    }
+
+    // Integration was connected after a connection task was created.
+    await updatePlannerRun(
+      latest.id,
+      {
+        pending_count: 0,
+        error: null,
+      },
+      env
+    );
+  }
+
+  if (!integrationConnected) {
+    if (
+      latest &&
+      Number(latest.pending_count) === 0 &&
+      latest.task === connectTask
+    ) {
+      return "none";
+    }
+
+    await createPlannerRun(
+      app,
+      source === "reddit"
+        ? "research"
+        : "lead_generation",
+      source,
+      connectTask,
+      env
+    );
+
+    return "created";
+  }
+
+  const names = niches
+    .map((niche) => niche.niche_name)
+    .filter(Boolean)
+    .slice(0, 10);
+
+  let task;
+  let workerType;
+
+  if (source === "reddit") {
+    workerType = "research";
+
+    task = JSON.stringify({
+      task_id: `reddit_${app.id}_${Date.now()}`,
+      worker: "reddit_research",
+      objective:
+        "Research recent public discussions to identify customer problems and buying signals.",
+      target_audience: names,
+      problem_categories: [
+        "lead_generation",
+        "customer_acquisition",
+        "outreach_personalization",
+        "lead_qualification",
+      ],
+      subreddits: [
+        "SaaS",
+        "Entrepreneur",
+        "startups",
+        "indiehackers",
+        "sales",
+      ],
+      published_within_days: 7,
+      target_new_posts: 20,
+    });
+  } else {
+    workerType = "lead_generation";
+
+    task = JSON.stringify({
+      task_id: `apollo_${app.id}_${Date.now()}`,
+      worker: "apollo_outreach",
+      objective:
+        "Find relevant business leads for prioritized customer segments. Do not send outreach without user approval.",
+      target_niches: names,
+      actions: [
+        "find_matching_companies",
+        "identify_relevant_contacts",
+        "collect_available_business_emails",
+        "prepare_personalized_draft_messages",
+      ],
+    });
+  }
+
+  await createPlannerRun(
+    app,
+    workerType,
+    source,
+    task,
+    env
+  );
+
+  return "created";
+          }
