@@ -1,106 +1,245 @@
-/**
- * Reportli AI Planner — Cloudflare Worker
- *
- * Required secrets:
- *   SUPABASE_URL
- *   SUPABASE_SERVICE_ROLE_KEY
- *   SARVAM_API_KEY
- *
- * Optional:
- *   WEBHOOK_SECRET
- *
- * Cron: every 30 minutes.
- */
+// ============================================================
+// REPORTLI AI PLANNER
+// Version: 6.0 - Sarvam JSON response fix
+//
+// Responsibilities:
+// 1. Health check
+// 2. Supabase connection test
+// 3. Company analysis using Sarvam AI
+// 4. Discover exactly 10 short customer niches
+// 5. Save company knowledge to business_data
+// 6. Save niches to customer_niches
+// 7. Create deterministic Reddit/Apollo planner tasks
+// 8. Avoid duplicate pending planner tasks
+//
+// Cloudflare secrets:
+// SUPABASE_URL
+// SUPABASE_SERVICE_ROLE_KEY
+// SARVAM_API_KEY
+//
+// Optional secret:
+// WEBHOOK_SECRET
+// ============================================================
 
-const SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions";
-const SARVAM_MODEL = "sarvam-105b";
+const VERSION = "6.0-sarvam-json-fix";
 
-const NICHE_PERCENTAGES = [19, 16, 13, 11, 10, 9, 8, 6, 5, 3];
-const MAX_CONTEXT_CHARS = 8000;
+const SARVAM_URL =
+  "https://api.sarvam.ai/v1/chat/completions";
 
-/* =========================================================
-   1. MAIN REQUEST HANDLER
-========================================================= */
+const BUSINESS_FIELDS = [
+  "company_summary",
+  "product_or_service",
+  "ideal_customer_types",
+  "problems_solved",
+];
+
+// These are relative buying-priority weights.
+// They are distinct and total 100.
+const NICHE_WEIGHTS = [
+  19, 16, 13, 11, 10, 9, 8, 6, 5, 3,
+];
+
+const MAX_SARVAM_ATTEMPTS = 2;
+const SARVAM_MAX_TOKENS = 4096;
+
+// ============================================================
+// ENTRY POINT
+// ============================================================
 
 export default {
   async fetch(request, env, ctx) {
     const requestId = crypto.randomUUID();
 
-    console.log("Incoming request", {
-      requestId,
-      method: request.method,
-    });
-
     try {
+      const url = new URL(request.url);
+
       if (request.method === "GET") {
         return jsonResponse({
           ok: true,
           worker: "reportli-ai-planner",
-          version: "5.0-short-prompts",
-          time: new Date().toISOString(),
+          version: VERSION,
+          message: "Worker is running.",
+          requestId,
+          timestamp: new Date().toISOString(),
         });
       }
 
       if (request.method !== "POST") {
         return jsonResponse(
-          { error: "Method not allowed. Use GET or POST." },
+          {
+            ok: false,
+            requestId,
+            error: "Method not allowed. Use POST.",
+          },
           405
         );
       }
 
+      // Optional webhook authentication.
       if (env.WEBHOOK_SECRET) {
-        const supplied = request.headers.get("x-webhook-secret");
+        const suppliedSecret =
+          request.headers.get("x-webhook-secret");
 
-        if (supplied !== env.WEBHOOK_SECRET) {
-          return jsonResponse({ error: "Unauthorized" }, 401);
+        if (suppliedSecret !== env.WEBHOOK_SECRET) {
+          return jsonResponse(
+            {
+              ok: false,
+              requestId,
+              error: "Unauthorized.",
+            },
+            401
+          );
         }
       }
 
-      const body = await request.json().catch(() => ({}));
+      validateEnvironment(env);
 
-      // Test Supabase connection.
+      let body;
+
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse(
+          {
+            ok: false,
+            requestId,
+            error: "Request body must be valid JSON.",
+          },
+          400
+        );
+      }
+
+      // ------------------------------------------------------
+      // ACTION: TEST SUPABASE
+      // ------------------------------------------------------
+
       if (body.test_supabase === true) {
-        const result = await testSupabase(env);
+        const result = await supabaseRequest(
+          env,
+          "/applications?select=id&limit=1",
+          { method: "GET" }
+        );
 
         return jsonResponse({
           ok: true,
           requestId,
-          supabase: result,
+          action: "test_supabase",
+          message: "Supabase connection successful.",
+          rowsReturned: Array.isArray(result)
+            ? result.length
+            : null,
         });
       }
 
-      // Run Reddit/Apollo planner manually.
+      // ------------------------------------------------------
+      // ACTION: TEST SARVAM
+      // ------------------------------------------------------
+
+      if (body.test_sarvam === true) {
+        const result = await callSarvam(
+          env,
+          [
+            "Return exactly this JSON object:",
+            '{"ok":true}',
+            "Do not add any other text.",
+          ].join("\n")
+        );
+
+        const parsed = parseJsonObject(result);
+
+        return jsonResponse({
+          ok: true,
+          requestId,
+          action: "test_sarvam",
+          response: parsed,
+        });
+      }
+
+      // ------------------------------------------------------
+      // ACTION: ANALYZE A SPECIFIC APPLICATION
+      // ------------------------------------------------------
+
+      if (body.test_analysis === true) {
+        if (!body.application_id) {
+          return jsonResponse(
+            {
+              ok: false,
+              requestId,
+              error:
+                "application_id is required for test_analysis.",
+            },
+            400
+          );
+        }
+
+        const application = await getApplication(
+          env,
+          body.application_id
+        );
+
+        if (!application) {
+          return jsonResponse(
+            {
+              ok: false,
+              requestId,
+              error: "Application not found.",
+            },
+            404
+          );
+        }
+
+        const result = await processApplication(
+          env,
+          application
+        );
+
+        return jsonResponse({
+          ok: true,
+          requestId,
+          action: "test_analysis",
+          result,
+        });
+      }
+
+      // ------------------------------------------------------
+      // ACTION: RUN RESEARCH PLANNER NOW
+      // ------------------------------------------------------
+
       if (body.run_research_planner === true) {
-        const result = await runScheduledResearchPlanner(env);
+        const result = await runResearchPlanner(env);
 
         return jsonResponse({
           ok: true,
           requestId,
-          researchPlanner: result,
-        });
-      }
-
-      // Test company analysis for a specific application.
-      if (body.test_analysis === true && body.application_id) {
-        const result = await processSpecificApplication(
-          String(body.application_id),
-          env,
-          true
-        );
-
-        return jsonResponse({
-          ok: true,
-          requestId,
+          action: "run_research_planner",
           result,
         });
       }
 
-      // Process a specific application.
+      // ------------------------------------------------------
+      // ACTION: PROCESS SPECIFIC APPLICATION
+      // ------------------------------------------------------
+
       if (body.application_id) {
-        const result = await processSpecificApplication(
-          String(body.application_id),
+        const application = await getApplication(
           env,
-          false
+          body.application_id
+        );
+
+        if (!application) {
+          return jsonResponse(
+            {
+              ok: false,
+              requestId,
+              error: "Application not found.",
+            },
+            404
+          );
+        }
+
+        const result = await processApplication(
+          env,
+          application
         );
 
         return jsonResponse({
@@ -110,8 +249,30 @@ export default {
         });
       }
 
-      // Otherwise, process the next pending application.
-      const result = await processNextPendingApplication(env);
+      // ------------------------------------------------------
+      // DEFAULT ACTION:
+      // PROCESS THE NEXT APPLICATION
+      // ------------------------------------------------------
+
+      const applications = await supabaseRequest(
+        env,
+        "/applications?select=*&order=created_at.asc&limit=1",
+        { method: "GET" }
+      );
+
+      if (!Array.isArray(applications) ||
+          applications.length === 0) {
+        return jsonResponse({
+          ok: true,
+          requestId,
+          message: "No applications found.",
+        });
+      }
+
+      const result = await processApplication(
+        env,
+        applications[0]
+      );
 
       return jsonResponse({
         ok: true,
@@ -119,710 +280,699 @@ export default {
         result,
       });
     } catch (error) {
-      console.error("Request failed", {
+      console.error("Planner request failed:", {
         requestId,
         message: error?.message || String(error),
-        stack: error?.stack,
       });
 
       return jsonResponse(
         {
           ok: false,
           requestId,
-          error: error?.message || String(error),
+          error: error?.message || "Unexpected Worker error.",
         },
         500
       );
     }
   },
 
-  // Runs automatically according to the cron schedule.
+  // ----------------------------------------------------------
+  // CRON: RUN EVERY 30 MINUTES
+  // ----------------------------------------------------------
+
   async scheduled(event, env, ctx) {
+    validateEnvironment(env);
+
     ctx.waitUntil(
-      runScheduledResearchPlanner(env).catch((error) => {
+      runScheduledJobs(env).catch((error) => {
         console.error(
-          "Scheduled research planner failed",
-          error?.message || error
+          "Scheduled planner failed:",
+          error?.message || String(error)
         );
       })
     );
   },
 };
 
-/* =========================================================
-   2. GENERAL HELPERS
-========================================================= */
+// ============================================================
+// HTTP RESPONSE HELPERS
+// ============================================================
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {
-      "content-type": "application/json; charset=utf-8",
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
     },
   });
 }
 
-function getSupabaseConfig(env) {
-  const url = (env.SUPABASE_URL || "").replace(/\/$/, "");
-  const key = env.SUPABASE_SERVICE_ROLE_KEY || "";
+function validateEnvironment(env) {
+  const required = [
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "SARVAM_API_KEY",
+  ];
 
-  if (!url || !key) {
+  const missing = required.filter(
+    (key) => !env[key]
+  );
+
+  if (missing.length > 0) {
     throw new Error(
-      "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY secret."
+      `Missing Cloudflare secrets: ${missing.join(", ")}`
     );
   }
-
-  return { url, key };
 }
 
-async function supabaseRequest(env, path, options = {}) {
-  const { url, key } = getSupabaseConfig(env);
+function normalizeSupabaseUrl(value) {
+  return value.replace(/\/+$/, "");
+}
 
-  const headers = new Headers(options.headers || {});
+// ============================================================
+// SUPABASE REST HELPERS
+// ============================================================
 
-  headers.set("apikey", key);
-  headers.set("authorization", `Bearer ${key}`);
-  headers.set("accept", "application/json");
+async function supabaseRequest(
+  env,
+  path,
+  options = {}
+) {
+  const baseUrl = normalizeSupabaseUrl(
+    env.SUPABASE_URL
+  );
 
-  if (options.body !== undefined) {
-    headers.set("content-type", "application/json");
-  }
+  const url = `${baseUrl}/rest/v1${path}`;
 
-  if (options.prefer) {
-    headers.set("prefer", options.prefer);
-  }
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization":
+      `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    ...(options.headers || {}),
+  };
 
-  const response = await fetch(`${url}/rest/v1/${path}`, {
+  const response = await fetch(url, {
     method: options.method || "GET",
     headers,
-    body:
-      options.body === undefined
-        ? undefined
-        : JSON.stringify(options.body),
+    body: options.body === undefined
+      ? undefined
+      : JSON.stringify(options.body),
   });
 
-  const responseText = await response.text();
-
-  let data = null;
-
-  if (responseText) {
-    try {
-      data = JSON.parse(responseText);
-    } catch {
-      data = responseText;
-    }
-  }
+  const text = await response.text();
 
   if (!response.ok) {
-    const detail =
-      typeof data === "string"
-        ? data
-        : JSON.stringify(data);
-
     throw new Error(
-      `Supabase ${options.method || "GET"} ${path} failed ` +
-      `(${response.status}): ${detail}`
+      `Supabase HTTP ${response.status} on ${path}: ` +
+      text.slice(0, 2000)
     );
   }
 
-  return data;
-}
-
-async function testSupabase(env) {
-  const rows = await supabaseRequest(
-    env,
-    "applications?select=id,name&limit=1"
-  );
-
-  return {
-    connected: true,
-    sampleRows: Array.isArray(rows) ? rows.length : 0,
-  };
-}
-
-/* =========================================================
-   3. APPLICATION MANAGEMENT
-========================================================= */
-
-async function getApplication(applicationId, env) {
-  const rows = await supabaseRequest(
-    env,
-    `applications?select=id,name,api_key,status,user_id,domain,company,planner_status,created_at&id=eq.${encodeURIComponent(applicationId)}&limit=1`
-  );
-
-  return Array.isArray(rows) ? rows[0] || null : null;
-}
-
-async function getNextPendingApplication(env) {
-  const rows = await supabaseRequest(
-    env,
-    "applications?select=id,name,api_key,status,user_id,domain,company,planner_status,created_at&planner_status=eq.pending&order=created_at.asc&limit=1"
-  );
-
-  return Array.isArray(rows) ? rows[0] || null : null;
-}
-
-async function claimApplication(applicationId, env, force = false) {
-  const filter = force
-    ? `id=eq.${encodeURIComponent(applicationId)}`
-    : `id=eq.${encodeURIComponent(applicationId)}&planner_status=eq.pending`;
-
-  const rows = await supabaseRequest(
-    env,
-    `applications?${filter}`,
-    {
-      method: "PATCH",
-      prefer: "return=representation",
-      body: {
-        planner_status: "working",
-      },
-    }
-  );
-
-  if (Array.isArray(rows) && rows.length) {
-    return rows[0];
+  if (!text.trim()) {
+    return null;
   }
-
-  if (force) {
-    const app = await getApplication(applicationId, env);
-
-    if (!app) {
-      throw new Error(`Application not found: ${applicationId}`);
-    }
-
-    return app;
-  }
-
-  return null;
-}
-
-async function processNextPendingApplication(env) {
-  const app = await getNextPendingApplication(env);
-
-  if (!app) {
-    return {
-      processed: false,
-      message: "No pending applications.",
-    };
-  }
-
-  return processSpecificApplication(app.id, env, false);
-}
-
-async function processSpecificApplication(
-  applicationId,
-  env,
-  force = false
-) {
-  const claimed = await claimApplication(
-    applicationId,
-    env,
-    force
-  );
-
-  if (!claimed) {
-    return {
-      processed: false,
-      application_id: applicationId,
-      message: "Application is not pending or is already claimed.",
-    };
-  }
-
-  return processClaimedApplication(claimed, env);
-}
-
-/* =========================================================
-   4. COMPANY PROCESSING
-========================================================= */
-
-async function processClaimedApplication(app, env) {
-  let plannerRunId = null;
-
-  const task =
-    `Analyze the company and find 10 customer niches for ${app.name || "this application"}`;
 
   try {
-    const runRows = await supabaseRequest(
-      env,
-      "planner_runs",
-      {
-        method: "POST",
-        prefer: "return=representation",
-        body: {
-          application_id: app.id,
-          user_id: app.user_id || null,
-          worker_type: "planner",
-          source: "system",
-          task,
-          pending_count: 1,
-          error: null,
-        },
-      }
-    );
-
-    plannerRunId = Array.isArray(runRows)
-      ? runRows[0]?.id || null
-      : null;
-
-    const context = await buildCompanyContext(app, env);
-
-    const analysis = await analyzeCompany(
-      app,
-      context,
-      env
-    );
-
-    await saveBusinessData(
-      env,
-      app.id,
-      "company_analysis",
-      analysis
-    );
-
-    const niches = await generateCustomerNiches(
-      app,
-      analysis,
-      env
-    );
-
-    await saveCustomerNiches(app, niches, env);
-
-    await updateApplicationStatus(
-      app.id,
-      "completed",
-      env
-    );
-
-    if (plannerRunId) {
-      await updatePlannerRun(
-        plannerRunId,
-        {
-          pending_count: 0,
-          error: null,
-        },
-        env
-      );
-    }
-
-    return {
-      processed: true,
-      application_id: app.id,
-      company_analysis_saved: true,
-      niches_saved: niches.length,
-      buying_intention_percentages: NICHE_PERCENTAGES,
-    };
-  } catch (error) {
-    const message = error?.message || String(error);
-
-    console.error("Application processing failed", {
-      applicationId: app.id,
-      message,
-    });
-
-    try {
-      await updateApplicationStatus(
-        app.id,
-        "failed",
-        env
-      );
-    } catch (statusError) {
-      console.error(
-        "Could not mark application failed",
-        statusError?.message || statusError
-      );
-    }
-
-    if (plannerRunId) {
-      try {
-        await updatePlannerRun(
-          plannerRunId,
-          {
-            pending_count: 0,
-            error: message.slice(0, 1500),
-          },
-          env
-        );
-      } catch (updateError) {
-        console.error(
-          "Could not update planner run",
-          updateError?.message || updateError
-        );
-      }
-    }
-
-    throw error;
-  }
-}
-
-async function updateApplicationStatus(
-  applicationId,
-  status,
-  env
-) {
-  await supabaseRequest(
-    env,
-    `applications?id=eq.${encodeURIComponent(applicationId)}`,
-    {
-      method: "PATCH",
-      prefer: "return=minimal",
-      body: {
-        planner_status: status,
-      },
-    }
-  );
-}
-
-async function updatePlannerRun(runId, values, env) {
-  await supabaseRequest(
-    env,
-    `planner_runs?id=eq.${encodeURIComponent(runId)}`,
-    {
-      method: "PATCH",
-      prefer: "return=minimal",
-      body: values,
-    }
-  );
-}
-
-/* =========================================================
-   5. BUILD SHORT COMPANY CONTEXT
-========================================================= */
-
-async function buildCompanyContext(app, env) {
-  const pieces = [
-    app.name ? `Application name: ${app.name}` : "",
-    app.company ? `Company: ${app.company}` : "",
-    app.domain ? `Domain: ${app.domain}` : "",
-  ].filter(Boolean);
-
-  const rows = await supabaseRequest(
-    env,
-    `business_data?select=field,data&application_id=eq.${encodeURIComponent(app.id)}&order=updated_at.desc&limit=20`
-  );
-
-  let remaining = MAX_CONTEXT_CHARS;
-
-  for (const row of Array.isArray(rows) ? rows : []) {
-    if (!row || !row.data) continue;
-
-    const text = flattenText(row.data);
-
-    if (!text) continue;
-
-    const snippet = text.slice(
-      0,
-      Math.min(remaining, 1800)
-    );
-
-    if (snippet) {
-      pieces.push(
-        `${row.field || "Company information"}: ${snippet}`
-      );
-    }
-
-    remaining -= snippet.length;
-
-    if (remaining <= 0) break;
-  }
-
-  return pieces.join("\n").slice(0, MAX_CONTEXT_CHARS);
-}
-
-function flattenText(value) {
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map(flattenText).filter(Boolean).join("\n");
-  }
-
-  if (value && typeof value === "object") {
-    const preferred = [
-      "text",
-      "content",
-      "title",
-      "description",
-      "summary",
-      "url",
-      "body",
-    ];
-
-    const values = [];
-
-    for (const key of preferred) {
-      if (value[key] !== undefined) {
-        values.push(
-          `${key}: ${flattenText(value[key])}`
-        );
-      }
-    }
-
-    if (!values.length) {
-      values.push(JSON.stringify(value));
-    }
-
-    return values.join("\n");
-  }
-
-  return value == null ? "" : String(value);
-}
-
-/* =========================================================
-   6. SARVAM API
-========================================================= */
-
-async function callSarvam(
-  messages,
-  env,
-  maxTokens = 900
-) {
-  if (!env.SARVAM_API_KEY) {
-    throw new Error("Missing SARVAM_API_KEY secret.");
-  }
-
-  const response = await fetch(SARVAM_API_URL, {
-    method: "POST",
-    headers: {
-      "api-subscription-key": env.SARVAM_API_KEY,
-      "content-type": "application/json",
-      "accept": "application/json",
-    },
-    body: JSON.stringify({
-      model: SARVAM_MODEL,
-      messages,
-      temperature: 0.2,
-      max_tokens: maxTokens,
-      response_format: {
-        type: "json_object",
-      },
-    }),
-  });
-
-  const raw = await response.text();
-
-  let result;
-
-  try {
-    result = JSON.parse(raw);
+    return JSON.parse(text);
   } catch {
     throw new Error(
-      `Sarvam returned invalid JSON (HTTP ${response.status}): ` +
-      raw.slice(0, 400)
+      `Supabase returned invalid JSON on ${path}: ` +
+      text.slice(0, 1000)
     );
   }
-
-  if (!response.ok) {
-    const message =
-      result?.error?.message ||
-      result?.message ||
-      raw.slice(0, 400);
-
-    throw new Error(
-      `Sarvam API error ${response.status}: ${message}`
-    );
-  }
-
-  let content = result?.choices?.[0]?.message?.content;
-
-  if (Array.isArray(content)) {
-    content = content
-      .map((part) =>
-        typeof part === "string"
-          ? part
-          : part?.text || ""
-      )
-      .join("\n");
-  }
-
-  if (typeof content !== "string" || !content.trim()) {
-    throw new Error(
-      "Sarvam returned empty content. Response: " +
-      JSON.stringify(result).slice(0, 600)
-    );
-  }
-
-  return content.trim();
 }
 
-function parseModelJson(content) {
-  const cleaned = content
+function queryValue(value) {
+  return encodeURIComponent(String(value));
+}
+
+async function getApplication(env, applicationId) {
+  const path =
+    "/applications?select=*&id=eq." +
+    queryValue(applicationId) +
+    "&limit=1";
+
+  const rows = await supabaseRequest(
+    env,
+    path,
+    { method: "GET" }
+  );
+
+  return Array.isArray(rows) && rows.length > 0
+    ? rows[0]
+    : null;
+}
+
+// ============================================================
+// SARVAM AI
+//
+// Main fix:
+// - reasoning_effort: null disables reasoning on V1
+// - max_tokens explicitly set to 4096
+// - retries empty/truncated content once
+// - reports finish_reason and usage when unsuccessful
+// - never treats reasoning_content as the final JSON
+// ============================================================
+
+async function callSarvam(env, prompt) {
+  let lastError = null;
+
+  for (
+    let attempt = 1;
+    attempt <= MAX_SARVAM_ATTEMPTS;
+    attempt++
+  ) {
+    const currentPrompt = attempt === 1
+      ? prompt
+      : [
+          "IMPORTANT: Return the requested JSON now.",
+          "Do not reason aloud.",
+          "Do not explain.",
+          "Return one complete JSON object only.",
+          "",
+          prompt,
+        ].join("\n");
+
+    let response;
+
+    try {
+      response = await fetch(SARVAM_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "api-subscription-key": env.SARVAM_API_KEY,
+        },
+        body: JSON.stringify({
+          model: "sarvam-105b",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a structured-data generator. " +
+                "Return only the requested final JSON. " +
+                "Do not include markdown fences or explanations.",
+            },
+            {
+              role: "user",
+              content: currentPrompt,
+            },
+          ],
+
+          // This is the key fix for the reported issue.
+          // Sarvam V1 supports null to disable reasoning.
+          reasoning_effort: null,
+
+          temperature: 0.1,
+          max_tokens: SARVAM_MAX_TOKENS,
+          stream: false,
+        }),
+      });
+    } catch (error) {
+      lastError = new Error(
+        `Could not reach Sarvam API: ${
+          error?.message || String(error)
+        }`
+      );
+
+      if (attempt < MAX_SARVAM_ATTEMPTS) {
+        await sleep(500);
+        continue;
+      }
+
+      throw lastError;
+    }
+
+    const rawText = await response.text();
+
+    let data;
+
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      lastError = new Error(
+        `Sarvam returned invalid response JSON. ` +
+        `HTTP ${response.status}. Response: ` +
+        rawText.slice(0, 1200)
+      );
+
+      if (attempt < MAX_SARVAM_ATTEMPTS) {
+        await sleep(500);
+        continue;
+      }
+
+      throw lastError;
+    }
+
+    if (!response.ok) {
+      const apiMessage =
+        data?.error?.message ||
+        data?.message ||
+        rawText;
+
+      // Do not retry quota or authentication failures.
+      if (
+        response.status === 402 ||
+        response.status === 403 ||
+        response.status === 401
+      ) {
+        throw new Error(
+          `Sarvam API HTTP ${response.status}: ` +
+          String(apiMessage).slice(0, 1200)
+        );
+      }
+
+      lastError = new Error(
+        `Sarvam API HTTP ${response.status}: ` +
+        String(apiMessage).slice(0, 1200)
+      );
+
+      if (
+        attempt < MAX_SARVAM_ATTEMPTS &&
+        (
+          response.status === 429 ||
+          response.status >= 500
+        )
+      ) {
+        await sleep(800 * attempt);
+        continue;
+      }
+
+      throw lastError;
+    }
+
+    const choice = data?.choices?.[0];
+    const message = choice?.message;
+    const content = message?.content;
+    const finishReason = choice?.finish_reason;
+
+    // Standard text response.
+    if (
+      typeof content === "string" &&
+      content.trim().length > 0
+    ) {
+      if (finishReason === "length") {
+        lastError = new Error(
+          "Sarvam response was truncated at the token limit."
+        );
+
+        if (attempt < MAX_SARVAM_ATTEMPTS) {
+          await sleep(500);
+          continue;
+        }
+
+        throw lastError;
+      }
+
+      return content.trim();
+    }
+
+    // Some APIs return content as an array of text blocks.
+    if (Array.isArray(content)) {
+      const combined = content
+        .map((part) => {
+          if (typeof part === "string") {
+            return part;
+          }
+
+          if (typeof part?.text === "string") {
+            return part.text;
+          }
+
+          return "";
+        })
+        .join("")
+        .trim();
+
+      if (combined) {
+        return combined;
+      }
+    }
+
+    const usage = data?.usage || {};
+
+    lastError = new Error(
+      "Sarvam returned empty content. " +
+      `finish_reason=${finishReason || "unknown"}, ` +
+      `completion_tokens=${usage.completion_tokens ?? "unknown"}, ` +
+      `reasoning_tokens=${
+        usage.completion_tokens_details?.reasoning_tokens ??
+        "unknown"
+      }, ` +
+      `attempt=${attempt}/${MAX_SARVAM_ATTEMPTS}.`
+    );
+
+    console.error("Sarvam empty-content diagnostic:", {
+      finishReason,
+      completionTokens: usage.completion_tokens,
+      reasoningTokens:
+        usage.completion_tokens_details?.reasoning_tokens,
+      attempt,
+    });
+
+    if (attempt < MAX_SARVAM_ATTEMPTS) {
+      await sleep(500);
+      continue;
+    }
+  }
+
+  throw lastError || new Error(
+    "Sarvam failed to return content."
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============================================================
+// JSON PARSING AND VALIDATION
+// ============================================================
+
+function parseJsonObject(text) {
+  if (typeof text !== "string" || !text.trim()) {
+    throw new Error(
+      "Cannot parse Sarvam response: content is empty."
+    );
+  }
+
+  let cleaned = text.trim();
+
+  // Remove optional markdown code fences.
+  cleaned = cleaned
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/, "")
     .trim();
 
+  // First attempt: complete response is JSON.
   try {
-    return JSON.parse(cleaned);
-  } catch {
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
+    const parsed = JSON.parse(cleaned);
 
-    if (start >= 0 && end > start) {
-      return JSON.parse(
-        cleaned.slice(start, end + 1)
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+    ) {
+      return parsed;
+    }
+  } catch {
+    // Continue to extraction below.
+  }
+
+  // Fallback: extract the outermost JSON object.
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    const extracted = cleaned.slice(
+      firstBrace,
+      lastBrace + 1
+    );
+
+    try {
+      const parsed = JSON.parse(extracted);
+
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed)
+      ) {
+        return parsed;
+      }
+    } catch {
+      // Report a clear error below.
+    }
+  }
+
+  throw new Error(
+    "Sarvam did not return a valid JSON object. Response: " +
+    cleaned.slice(0, 1500)
+  );
+}
+
+function normalizeString(value, maxLength = 2000) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.trim().slice(0, maxLength);
+}
+
+function normalizeStringArray(value, maxItems = 10) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((item) => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+// ============================================================
+// COMPANY CONTEXT
+// ============================================================
+
+function buildCompanyContext(application) {
+  const parts = [];
+
+  if (application.name) {
+    parts.push(`Application name: ${application.name}`);
+  }
+
+  if (application.domain) {
+    parts.push(`Website/domain: ${application.domain}`);
+  }
+
+  if (application.company) {
+    if (typeof application.company === "string") {
+      parts.push(
+        `Company information: ${application.company}`
+      );
+    } else {
+      parts.push(
+        "Company information: " +
+        JSON.stringify(application.company)
       );
     }
-
-    throw new Error(
-      `Sarvam output was not valid JSON: ${cleaned.slice(0, 400)}`
-    );
   }
-}
 
-/* =========================================================
-   7. SHORT COMPANY ANALYSIS PROMPT
-========================================================= */
-
-async function analyzeCompany(app, context, env) {
-  const prompt =
-    `Analyze this company for customer discovery. ` +
-    `Use only supplied facts; do not invent facts. ` +
-    `Return JSON with keys: company_summary (string), ` +
-    `product_or_service (string), ideal_customer_types (array), ` +
-    `problems_solved (array). Keep values concise.\n\n` +
-    `Company facts:\n${context.slice(0, 6000)}`;
-
-  const content = await callSarvam(
-    [
-      {
-        role: "system",
-        content:
-          "You are a concise B2B market analyst. Return valid JSON only.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-    env,
-    700
-  );
-
-  return parseModelJson(content);
-}
-
-/* =========================================================
-   8. SHORT CUSTOMER NICHE GENERATION
-========================================================= */
-
-async function generateCustomerNiches(
-  app,
-  analysis,
-  env
-) {
-  const companyFacts = JSON.stringify(analysis).slice(0, 3000);
-
-  const prompt =
-    `Generate exactly 10 distinct customer segment names. ` +
-    `Each name must be 1-4 words and identify WHO buys. ` +
-    `Examples: Freelancers, Website Agencies, SaaS Startups, ` +
-    `Recruitment Agencies. No sentences, strategies, outreach ` +
-    `methods, platforms, or near-duplicates. ` +
-    `Order highest to lowest estimated buying priority. ` +
-    `Return JSON only: {"niches":["Name 1","Name 2"]}. ` +
-    `Do not return scores or buying_intention.\n` +
-    `Company: ${app.name || "Unknown"}\n` +
-    `Facts: ${companyFacts}`;
-
-  const content = await callSarvam(
-    [
-      {
-        role: "system",
-        content:
-          "Return valid JSON only. The niches array must contain exactly 10 short labels.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-    env,
-    500
-  );
-
-  const parsed = parseModelJson(content);
-
-  const values = Array.isArray(parsed)
-    ? parsed
-    : parsed.niches;
-
-  if (!Array.isArray(values)) {
-    throw new Error(
-      "Sarvam niche output must contain a niches array."
+  if (application.description) {
+    parts.push(
+      `Description: ${application.description}`
     );
   }
 
-  const cleaned = [];
-  const seen = new Set();
+  return parts.join("\n").slice(0, 10000);
+}
 
-  for (const item of values) {
-    const rawName =
-      typeof item === "string"
-        ? item
-        : item?.niche_name || item?.name || "";
+// ============================================================
+// COMPANY ANALYSIS
+// ============================================================
 
-    const name = cleanNicheName(rawName);
+async function analyzeCompany(env, application) {
+  const context = buildCompanyContext(application);
 
-    const key = name
-      .toLowerCase()
-      .replace(/[^a-z0-9 ]/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    if (name && !seen.has(key)) {
-      seen.add(key);
-      cleaned.push(name);
-    }
-  }
-
-  if (cleaned.length < 10) {
+  if (!context.trim()) {
     throw new Error(
-      `Sarvam returned only ${cleaned.length} distinct short niches; ` +
-      "expected 10. Check API credits and retry."
+      "The application has no company name or company context. " +
+      "Add company information before running analysis."
     );
   }
 
-  return cleaned.slice(0, 10).map(
-    (niche_name, index) => ({
-      niche_name,
-      buying_intention: NICHE_PERCENTAGES[index],
-    })
-  );
+  const prompt = `
+Analyze this company using only the supplied information.
+
+COMPANY:
+${context}
+
+Return one JSON object with exactly these keys:
+{
+  "company_summary": "One or two short sentences",
+  "product_or_service": "What the company sells or provides",
+  "ideal_customer_types": [
+    "Short customer type",
+    "Another short customer type"
+  ],
+  "problems_solved": [
+    "Short problem",
+    "Another short problem"
+  ]
 }
+
+Rules:
+- Do not invent facts.
+- If information is missing, say "Not enough information".
+- Customer types must be concise.
+- Return valid JSON only.
+`.trim();
+
+  const raw = await callSarvam(env, prompt);
+  const parsed = parseJsonObject(raw);
+
+  const analysis = {
+    company_summary: normalizeString(
+      parsed.company_summary
+    ),
+    product_or_service: normalizeString(
+      parsed.product_or_service
+    ),
+    ideal_customer_types: normalizeStringArray(
+      parsed.ideal_customer_types,
+      10
+    ),
+    problems_solved: normalizeStringArray(
+      parsed.problems_solved,
+      10
+    ),
+  };
+
+  if (
+    !analysis.company_summary &&
+    !analysis.product_or_service
+  ) {
+    throw new Error(
+      "Sarvam returned JSON but no usable company analysis."
+    );
+  }
+
+  return analysis;
+}
+
+// ============================================================
+// NICHE NAME CLEANING
+// ============================================================
 
 function cleanNicheName(value) {
-  let name = String(value || "").trim();
+  if (typeof value !== "string") {
+    return "";
+  }
 
-  name = name.replace(/^[-*\d.)\s]+/, "");
-
-  name = name.replace(
-    /\b(direct[- ]to[- ]consumer|brands?|companies|businesses|that want to|looking to|generating leads|attracting clients|on shopify|on linkedin|using linkedin|using shopify)\b/gi,
-    " "
-  );
-
-  name = name
-    .replace(/[,:;.!?()[\]{}]/g, " ")
+  let name = value
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/["'`]/g, "")
+    .replace(/[.!?]+$/g, "")
     .replace(/\s+/g, " ")
     .trim();
+
+  // Remove common filler phrases.
+  name = name.replace(
+    /^(companies|businesses|people|customers|target customers|ideal customers)\s+(such as|like|including)\s+/i,
+    ""
+  );
 
   const words = name
     .split(" ")
     .filter(Boolean)
     .slice(0, 4);
 
-  if (!words.length) return "";
+  name = words.join(" ");
 
-  return words
-    .map(
-      (word) =>
-        word.charAt(0).toUpperCase() + word.slice(1)
-    )
-    .join(" ");
+  if (!name) {
+    return "";
+  }
+
+  return name;
 }
 
-/* =========================================================
-   9. SAVE BUSINESS DATA
-========================================================= */
+// ============================================================
+// NICHE DISCOVERY
+// ============================================================
+
+async function discoverNiches(env, application, analysis) {
+  const companyContext = buildCompanyContext(application);
+
+  const compactAnalysis = {
+    company_summary: analysis.company_summary,
+    product_or_service: analysis.product_or_service,
+    ideal_customer_types: analysis.ideal_customer_types,
+    problems_solved: analysis.problems_solved,
+  };
+
+  const prompt = `
+Find exactly 10 distinct customer segments that may buy this company's product.
+
+COMPANY:
+${companyContext}
+
+ANALYSIS:
+${JSON.stringify(compactAnalysis)}
+
+Return only this JSON structure:
+{
+  "niches": [
+    "Freelancers",
+    "Website Agencies"
+  ]
+}
+
+Rules:
+- Exactly 10 niches.
+- Each niche must be 1 to 4 words.
+- Use short labels, not sentences.
+- Examples: "Freelancers", "Website Agencies", "SaaS Startups".
+- Each niche must be a customer segment, not a marketing strategy.
+- Avoid duplicate or nearly identical niches.
+- Prioritize segments likely to pay for this product.
+- Do not invent unsupported company facts.
+- Return JSON only.
+`.trim();
+
+  const raw = await callSarvam(env, prompt);
+  const parsed = parseJsonObject(raw);
+
+  if (!Array.isArray(parsed.niches)) {
+    throw new Error(
+      'Sarvam niche response must contain a "niches" array.'
+    );
+  }
+
+  const seen = new Set();
+  const niches = [];
+
+  for (const rawName of parsed.niches) {
+    const name = cleanNicheName(rawName);
+    const key = name.toLowerCase();
+
+    if (!name || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    niches.push(name);
+
+    if (niches.length === 10) {
+      break;
+    }
+  }
+
+  if (niches.length !== 10) {
+    throw new Error(
+      `Sarvam returned only ${niches.length} unique valid niches. ` +
+      "A full set of 10 is required. Please retry the analysis."
+    );
+  }
+
+  return niches;
+}
+
+// ============================================================
+// BUSINESS DATA SAVE
+//
+// Expected business_data columns:
+// id
+// application_id
+// field
+// data
+// source_url (optional)
+// created_at (optional)
+//
+// This uses GET + PATCH/POST instead of relying on a unique
+// constraint that may not exist in the database.
+// ============================================================
 
 async function saveBusinessData(
   env,
@@ -830,399 +980,646 @@ async function saveBusinessData(
   field,
   data
 ) {
-  const query =
-    `business_data?select=id&application_id=eq.${encodeURIComponent(applicationId)}` +
-    `&field=eq.${encodeURIComponent(field)}&limit=1`;
+  const lookupPath =
+    "/business_data?select=id,application_id,field" +
+    "&application_id=eq." +
+    queryValue(applicationId) +
+    "&field=eq." +
+    queryValue(field) +
+    "&limit=1";
 
-  const existing = await supabaseRequest(env, query);
+  const existing = await supabaseRequest(
+    env,
+    lookupPath,
+    { method: "GET" }
+  );
 
   const payload = {
     application_id: applicationId,
     field,
     data,
-    updated_at: new Date().toISOString(),
   };
 
   if (
     Array.isArray(existing) &&
-    existing.length &&
+    existing.length > 0 &&
     existing[0].id
   ) {
+    const id = existing[0].id;
+
     await supabaseRequest(
       env,
-      `business_data?id=eq.${encodeURIComponent(existing[0].id)}`,
+      "/business_data?id=eq." + queryValue(id),
       {
         method: "PATCH",
-        prefer: "return=minimal",
-        body: payload,
+        body: { data },
+        headers: {
+          "Prefer": "return=minimal",
+        },
       }
     );
-  } else {
-    // POST avoids depending on a unique constraint.
-    await supabaseRequest(
-      env,
-      "business_data",
-      {
-        method: "POST",
-        prefer: "return=minimal",
-        body: payload,
-      }
-    );
-  }
-}
 
-/* =========================================================
-   10. SAVE CUSTOMER NICHES AND PERCENTAGES
-========================================================= */
-
-async function saveCustomerNiches(app, niches, env) {
-  if (!Array.isArray(niches) || niches.length !== 10) {
-    throw new Error(
-      "Exactly 10 niches are required before saving."
-    );
+    return {
+      field,
+      action: "updated",
+    };
   }
 
-  const total = niches.reduce(
-    (sum, niche) => sum + Number(niche.buying_intention),
-    0
-  );
-
-  const distinctPercentages = new Set(
-    niches.map((niche) => niche.buying_intention)
-  );
-
-  if (
-    total !== 100 ||
-    distinctPercentages.size !== 10
-  ) {
-    throw new Error(
-      "Niche percentages must be distinct and sum to 100."
-    );
-  }
-
-  // Deactivate old active niches while preserving history.
   await supabaseRequest(
     env,
-    `customer_niches?application_id=eq.${encodeURIComponent(app.id)}&niche_status=eq.active`,
+    "/business_data",
     {
-      method: "PATCH",
-      prefer: "return=minimal",
-      body: {
-        niche_status: "inactive",
-        updated_at: new Date().toISOString(),
+      method: "POST",
+      body: payload,
+      headers: {
+        "Prefer": "return=minimal",
       },
     }
   );
 
-  const rows = niches.map((niche) => ({
-    application_id: app.id,
-    user_id: app.user_id || null,
-    niche_name: niche.niche_name,
-    buying_intention: niche.buying_intention,
-    niche_status: "active",
-  }));
+  return {
+    field,
+    action: "inserted",
+  };
+}
+
+// ============================================================
+// SAVE COMPANY ANALYSIS
+// ============================================================
+
+async function saveCompanyAnalysis(
+  env,
+  applicationId,
+  analysis
+) {
+  const results = [];
+
+  for (const field of BUSINESS_FIELDS) {
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        analysis,
+        field
+      )
+    ) {
+      continue;
+    }
+
+    results.push(
+      await saveBusinessData(
+        env,
+        applicationId,
+        field,
+        analysis[field]
+      )
+    );
+  }
+
+  return results;
+}
+
+// ============================================================
+// CUSTOMER NICHE SAVE
+//
+// Expected customer_niches columns:
+// application_id
+// niche_name
+// buying_intention
+// niche_status
+//
+// id, created_at, and updated_at may be generated by the DB.
+// user_id is included only when available.
+// ============================================================
+
+async function saveCustomerNiches(
+  env,
+  application,
+  nicheNames
+) {
+  const applicationId = application.id;
+
+  // Deactivate previously active niches.
+  // Do not delete history.
+  await supabaseRequest(
+    env,
+    "/customer_niches?application_id=eq." +
+      queryValue(applicationId) +
+      "&niche_status=eq.active",
+    {
+      method: "PATCH",
+      body: {
+        niche_status: "inactive",
+      },
+      headers: {
+        "Prefer": "return=minimal",
+      },
+    }
+  );
+
+  const rows = nicheNames.map((name, index) => {
+    const row = {
+      application_id: applicationId,
+      niche_name: name,
+      buying_intention: NICHE_WEIGHTS[index],
+      niche_status: "active",
+    };
+
+    if (application.user_id) {
+      row.user_id = String(application.user_id);
+    }
+
+    return row;
+  });
 
   await supabaseRequest(
     env,
-    "customer_niches",
+    "/customer_niches",
     {
       method: "POST",
-      prefer: "return=representation",
       body: rows,
+      headers: {
+        "Prefer": "return=minimal",
+      },
     }
   );
+
+  return {
+    saved: rows.length,
+    totalBuyingIntention: NICHE_WEIGHTS.reduce(
+      (sum, value) => sum + value,
+      0
+    ),
+  };
 }
 
-/* =========================================================
-   11. REDDIT AND APOLLO INTEGRATIONS
-========================================================= */
+// ============================================================
+// PROCESS APPLICATION
+// ============================================================
 
-async function getActiveNiches(applicationId, env) {
-  const rows = await supabaseRequest(
-    env,
-    `customer_niches?select=id,niche_name,buying_intention&application_id=eq.${encodeURIComponent(applicationId)}&niche_status=eq.active&order=buying_intention.desc&limit=20`
+async function processApplication(env, application) {
+  if (!application?.id) {
+    throw new Error(
+      "Cannot process application without an id."
+    );
+  }
+
+  console.log(
+    "Processing application:",
+    application.id
   );
 
-  return Array.isArray(rows) ? rows : [];
+  // Step 1: Analyze company.
+  const analysis = await analyzeCompany(
+    env,
+    application
+  );
+
+  // Step 2: Save analysis to business_data.
+  const savedAnalysis = await saveCompanyAnalysis(
+    env,
+    application.id,
+    analysis
+  );
+
+  // Step 3: Discover 10 short customer niches.
+  const niches = await discoverNiches(
+    env,
+    application,
+    analysis
+  );
+
+  // Step 4: Save niches.
+  const savedNiches = await saveCustomerNiches(
+    env,
+    application,
+    niches
+  );
+
+  return {
+    application_id: application.id,
+    company_analysis: analysis,
+    business_data: savedAnalysis,
+    niches,
+    niche_save: savedNiches,
+    message: "Company analysis and niche discovery completed.",
+  };
 }
 
-async function getIntegrationConnected(
+// ============================================================
+// PLANNER TASK HELPERS
+// ============================================================
+
+function makeTaskId(source, applicationId, nicheId = "general") {
+  const safeApp = String(applicationId)
+    .replace(/[^a-zA-Z0-9_-]/g, "")
+    .slice(0, 40);
+
+  const safeNiche = String(nicheId)
+    .replace(/[^a-zA-Z0-9_-]/g, "")
+    .slice(0, 40);
+
+  const timeBucket = Math.floor(
+    Date.now() / (30 * 60 * 1000)
+  );
+
+  return `${source}_${safeApp}_${safeNiche}_${timeBucket}`;
+}
+
+function makeConnectTask(source) {
+  const isReddit = source === "reddit";
+
+  return {
+    task_type: isReddit
+      ? "connect_reddit"
+      : "connect_apollo",
+    worker: isReddit
+      ? "reddit_research"
+      : "apollo_lead_generation",
+    objective: isReddit
+      ? "Connect Reddit so the research worker can discover recent customer problems."
+      : "Connect Apollo so the lead-generation worker can find relevant prospects.",
+    instructions: isReddit
+      ? [
+          "Ask the user to connect Reddit.",
+          "Do not claim that research has been completed.",
+          "Run research only after the integration is connected.",
+        ]
+      : [
+          "Ask the user to connect Apollo.",
+          "Do not claim that leads have been found.",
+          "Run lead generation only after the integration is connected.",
+        ],
+  };
+}
+
+function makeResearchTask(application, source) {
+  const isReddit = source === "reddit";
+
+  return {
+    task_id: makeTaskId(source, application.id),
+    application_id: application.id,
+    worker: isReddit
+      ? "reddit_research"
+      : "apollo_lead_generation",
+    objective: isReddit
+      ? "Find recent customer problems and buying signals relevant to the company's target customers."
+      : "Find relevant prospects matching the company's target customer segments.",
+    target_audience: [
+      "Potential customers matching the company's target segments",
+      "People and businesses likely to need the company's product",
+    ],
+    source: isReddit ? "reddit" : "apollo",
+    constraints: {
+      do_not_invent_results: true,
+      avoid_duplicates: true,
+    },
+    ...(isReddit
+      ? {
+          subreddits: [
+            "SaaS",
+            "Entrepreneur",
+            "startups",
+            "indiehackers",
+            "sales",
+          ],
+          published_within_days: 7,
+          target_new_posts: 20,
+          problem_categories: [
+            "lead_generation",
+            "cold_email",
+            "customer_acquisition",
+            "outreach_personalization",
+            "lead_qualification",
+          ],
+        }
+      : {
+          target_new_leads: 25,
+          require_relevant_company_fit: true,
+          require_available_contact_data: true,
+        }),
+  };
+}
+
+// ============================================================
+// CHECK INTEGRATION CONNECTION
+// ============================================================
+
+async function isIntegrationConnected(
+  env,
   applicationId,
-  integrationId,
-  env
+  integrationId
 ) {
+  const path =
+    "/user_integrations?select=id,status,integration_id" +
+    "&application_id=eq." +
+    queryValue(applicationId) +
+    "&integration_id=eq." +
+    queryValue(integrationId) +
+    "&status=eq.connected" +
+    "&limit=1";
+
   const rows = await supabaseRequest(
     env,
-    `user_integrations?select=id,status,integration_id&application_id=eq.${encodeURIComponent(applicationId)}&integration_id=eq.${encodeURIComponent(integrationId)}&status=eq.connected&limit=1`
+    path,
+    { method: "GET" }
   );
 
   return Array.isArray(rows) && rows.length > 0;
 }
 
-async function getLatestPlan(
+// ============================================================
+// PLANNER RUN LOOKUP
+// ============================================================
+
+async function getLatestPlannerRun(
+  env,
   applicationId,
-  source,
-  env
+  source
 ) {
+  const path =
+    "/planner_runs?select=id,application_id,worker_type,source,task,pending_count,created_at" +
+    "&application_id=eq." +
+    queryValue(applicationId) +
+    "&source=eq." +
+    queryValue(source) +
+    "&order=created_at.desc" +
+    "&limit=1";
+
   const rows = await supabaseRequest(
     env,
-    `planner_runs?select=id,application_id,worker_type,source,task,pending_count,created_at&application_id=eq.${encodeURIComponent(applicationId)}&source=eq.${encodeURIComponent(source)}&order=created_at.desc&limit=1`
+    path,
+    { method: "GET" }
   );
 
-  return Array.isArray(rows) ? rows[0] || null : null;
+  return Array.isArray(rows) && rows.length > 0
+    ? rows[0]
+    : null;
 }
+
+function parseStoredTask(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === "object") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function isSameTaskType(task, expectedType) {
+  const parsed = parseStoredTask(task);
+
+  return parsed?.task_type === expectedType;
+}
+
+// ============================================================
+// CREATE PLANNER RUN
+//
+// Schema constraints:
+// worker_type: research, lead_generation, planner
+// source: reddit, apollo, system
+//
+// Do not send a status field because planner_runs does not
+// have a confirmed status column.
+// ============================================================
 
 async function createPlannerRun(
-  app,
-  workerType,
+  env,
+  application,
   source,
   task,
-  env
+  pendingCount = 1
 ) {
-  const rows = await supabaseRequest(
-    env,
-    "planner_runs",
-    {
-      method: "POST",
-      prefer: "return=representation",
-      body: {
-        application_id: app.id,
-        user_id: app.user_id || null,
-        worker_type: workerType,
-        source,
-        task,
-        pending_count: 1,
-        error: null,
-      },
-    }
-  );
+  const workerType = source === "apollo"
+    ? "lead_generation"
+    : "research";
 
-  return Array.isArray(rows) ? rows[0] || null : null;
-}
-
-/* =========================================================
-   12. SCHEDULED REDDIT/APOLLO PLANNER
-========================================================= */
-
-async function runScheduledResearchPlanner(env) {
-  const apps = await supabaseRequest(
-    env,
-    "applications?select=id,name,user_id,domain,company,planner_status,created_at&order=created_at.asc&limit=100"
-  );
-
-  const summary = {
-    applications_checked: 0,
-    plans_created: 0,
-    plans_updated: 0,
-    skipped: 0,
-    errors: [],
-  };
-
-  for (const app of Array.isArray(apps) ? apps : []) {
-    summary.applications_checked++;
-
-    try {
-      const niches = await getActiveNiches(app.id, env);
-
-      if (!niches.length) {
-        summary.skipped++;
-        continue;
-      }
-
-      // Reddit is checked first.
-      const redditAction = await tryCreateSourcePlan(
-        app,
-        "reddit",
-        niches,
-        env
-      );
-
-      if (redditAction === "created") {
-        summary.plans_created++;
-        continue;
-      }
-
-      if (redditAction === "updated") {
-        summary.plans_updated++;
-        continue;
-      }
-
-      // If Reddit already has an active task, don't duplicate it.
-      if (redditAction === "blocked") {
-        summary.skipped++;
-        continue;
-      }
-
-      // If Reddit has no eligible task, check Apollo.
-      const apolloAction = await tryCreateSourcePlan(
-        app,
-        "apollo",
-        niches,
-        env
-      );
-
-      if (apolloAction === "created") {
-        summary.plans_created++;
-      } else if (apolloAction === "updated") {
-        summary.plans_updated++;
-      } else {
-        summary.skipped++;
-      }
-    } catch (error) {
-      summary.errors.push({
-        application_id: app.id,
-        error: (
-          error?.message || String(error)
-        ).slice(0, 500),
-      });
-
-      console.error("Research planner app failed", {
-        applicationId: app.id,
-        message: error?.message || String(error),
-      });
-    }
-  }
-
-  return summary;
-}
-
-async function tryCreateSourcePlan(
-  app,
-  source,
-  niches,
-  env
-) {
-  const integrationConnected =
-    await getIntegrationConnected(
-      app.id,
-      source,
-      env
-    );
-
-  const latest = await getLatestPlan(
-    app.id,
-    source,
-    env
-  );
-
-  const connectTask =
-    source === "reddit"
-      ? "Connect Reddit to run your research agent"
-      : "Connect Apollo to run your outreach agent";
-
-  // Don't create another plan if the latest one is still pending.
-  if (latest && Number(latest.pending_count) > 0) {
-    const wasConnectTask = latest.task === connectTask;
-
-    if (!integrationConnected) {
-      if (latest.task !== connectTask) {
-        await updatePlannerRun(
-          latest.id,
-          { task: connectTask },
-          env
-        );
-
-        return "updated";
-      }
-
-      return "blocked";
-    }
-
-    if (!wasConnectTask) {
-      return "blocked";
-    }
-
-    // Integration was connected after a connection task was created.
-    await updatePlannerRun(
-      latest.id,
-      {
-        pending_count: 0,
-        error: null,
-      },
-      env
-    );
-  }
-
-  if (!integrationConnected) {
-    if (
-      latest &&
-      Number(latest.pending_count) === 0 &&
-      latest.task === connectTask
-    ) {
-      return "none";
-    }
-
-    await createPlannerRun(
-      app,
-      source === "reddit"
-        ? "research"
-        : "lead_generation",
-      source,
-      connectTask,
-      env
-    );
-
-    return "created";
-  }
-
-  const names = niches
-    .map((niche) => niche.niche_name)
-    .filter(Boolean)
-    .slice(0, 10);
-
-  let task;
-  let workerType;
-
-  if (source === "reddit") {
-    workerType = "research";
-
-    task = JSON.stringify({
-      task_id: `reddit_${app.id}_${Date.now()}`,
-      worker: "reddit_research",
-      objective:
-        "Research recent public discussions to identify customer problems and buying signals.",
-      target_audience: names,
-      problem_categories: [
-        "lead_generation",
-        "customer_acquisition",
-        "outreach_personalization",
-        "lead_qualification",
-      ],
-      subreddits: [
-        "SaaS",
-        "Entrepreneur",
-        "startups",
-        "indiehackers",
-        "sales",
-      ],
-      published_within_days: 7,
-      target_new_posts: 20,
-    });
-  } else {
-    workerType = "lead_generation";
-
-    task = JSON.stringify({
-      task_id: `apollo_${app.id}_${Date.now()}`,
-      worker: "apollo_outreach",
-      objective:
-        "Find relevant business leads for prioritized customer segments. Do not send outreach without user approval.",
-      target_niches: names,
-      actions: [
-        "find_matching_companies",
-        "identify_relevant_contacts",
-        "collect_available_business_emails",
-        "prepare_personalized_draft_messages",
-      ],
-    });
-  }
-
-  await createPlannerRun(
-    app,
-    workerType,
+  const payload = {
+    application_id: application.id,
+    worker_type: workerType,
     source,
     task,
-    env
+    pending_count: pendingCount,
+  };
+
+  if (application.user_id) {
+    payload.user_id = String(application.user_id);
+  }
+
+  await supabaseRequest(
+    env,
+    "/planner_runs",
+    {
+      method: "POST",
+      body: payload,
+      headers: {
+        "Prefer": "return=minimal",
+      },
+    }
   );
 
-  return "created";
-          }
+  return {
+    created: true,
+    source,
+    worker_type: workerType,
+    task,
+  };
+}
+
+// ============================================================
+// TRY TO CREATE A REDDIT OR APOLLO PLAN
+//
+// Rules:
+// - Existing pending tasks prevent duplicates.
+// - If an integration is disconnected, create one connection
+//   task rather than pretending the worker ran.
+// - If an existing connection task is already pending, do not
+//   create it again.
+// - Reddit is checked before Apollo.
+// ============================================================
+
+async function tryCreateSourcePlan(
+  env,
+  application,
+  source
+) {
+  const integrationId = source;
+
+  const latest = await getLatestPlannerRun(
+    env,
+    application.id,
+    source
+  );
+
+  // Avoid duplicates when the most recent task is still pending.
+  if (
+    latest &&
+    Number(latest.pending_count) > 0
+  ) {
+    return {
+      created: false,
+      source,
+      reason: "A pending planner task already exists.",
+    };
+  }
+
+  const connected = await isIntegrationConnected(
+    env,
+    application.id,
+    integrationId
+  );
+
+  if (!connected) {
+    const connectTask = makeConnectTask(source);
+
+    // Avoid repeatedly creating the same connection request.
+    if (
+      latest &&
+      isSameTaskType(
+        latest.task,
+        connectTask.task_type
+      )
+    ) {
+      return {
+        created: false,
+        source,
+        reason:
+          "The connection task already exists and is not pending.",
+      };
+    }
+
+    const created = await createPlannerRun(
+      env,
+      application,
+      source,
+      connectTask,
+      1
+    );
+
+    return {
+      ...created,
+      connection_required: true,
+    };
+  }
+
+  const task = makeResearchTask(
+    application,
+    source
+  );
+
+  return await createPlannerRun(
+    env,
+    application,
+    source,
+    task,
+    1
+  );
+}
+
+// ============================================================
+// RUN RESEARCH PLANNER
+// ============================================================
+
+async function runResearchPlanner(env) {
+  const applications = await supabaseRequest(
+    env,
+    "/applications?select=id,name,user_id&order=created_at.asc",
+    { method: "GET" }
+  );
+
+  if (!Array.isArray(applications) ||
+      applications.length === 0) {
+    return {
+      applications_checked: 0,
+      created: [],
+      message: "No applications found.",
+    };
+  }
+
+  const created = [];
+  let checked = 0;
+
+  for (const application of applications) {
+    checked++;
+
+    // Reddit is always checked first.
+    const redditResult = await tryCreateSourcePlan(
+      env,
+      application,
+      "reddit"
+    );
+
+    if (redditResult.created) {
+      created.push({
+        application_id: application.id,
+        ...redditResult,
+      });
+
+      // At most one new task per application per run.
+      continue;
+    }
+
+    // If Reddit is already pending, do not create another task.
+    if (
+      redditResult.reason ===
+      "A pending planner task already exists."
+    ) {
+      continue;
+    }
+
+    // If Reddit is disconnected, its connection task takes
+    // priority. Apollo is checked in a later run.
+    if (redditResult.connection_required) {
+      continue;
+    }
+
+    // If Reddit has no pending task, check Apollo.
+    const apolloResult = await tryCreateSourcePlan(
+      env,
+      application,
+      "apollo"
+    );
+
+    if (apolloResult.created) {
+      created.push({
+        application_id: application.id,
+        ...apolloResult,
+      });
+    }
+  }
+
+  return {
+    applications_checked: checked,
+    tasks_created: created.length,
+    created,
+  };
+}
+
+// ============================================================
+// CRON HANDLER
+// ============================================================
+
+async function runScheduledJobs(env) {
+  console.log(
+    "Running scheduled Reportli planner:",
+    new Date().toISOString()
+  );
+
+  const result = await runResearchPlanner(env);
+
+  console.log(
+    "Scheduled planner completed:",
+    JSON.stringify(result)
+  );
+
+  return result;
+   }
