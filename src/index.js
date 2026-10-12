@@ -919,35 +919,7 @@ ${JSON.stringify({
 Company analysis:
 ${JSON.stringify(analysis)}
 
-Return customer SEGMENT NAMES ONLY.
-
-Good examples:
-- Freelancers
-- Website Agencies
-- SaaS Startups
-- Independent Creative Agencies
-- Recruitment Agencies
-- E-commerce Agencies
-- Financial Advisors
-- Marketing Consultants
-
-Bad examples:
-- Direct-to-consumer skincare and cosmetics brands on Shopify
-- Freelancers generating leads through LinkedIn comments
-- Website agencies that want to find more customers
-
-Rules:
-- Each niche_name must be 1 to 4 words.
-- Use a short label identifying WHO the customers are.
-- Never return a sentence or detailed description.
-- Do not include a marketing strategy or outreach method.
-- Do not include platforms such as Shopify or LinkedIn in the name
-  unless the platform is essential to identifying the segment.
-- Do not generate duplicate or nearly identical niches.
-- Order niches from highest to lowest estimated buying priority.
-- Return exactly 10 distinct niches.
-- Do not return buying_intention values.
-- Return JSON only.
+Generate exactly 10 distinct customer segment names, each 1–4 words (e.g., Freelancers, Website Agencies, SaaS Startups). Identify WHO the customers are, not their goals, strategies, or platforms. Avoid descriptions, duplicates, and near-duplicates. Order niches from highest to lowest estimated buying priority. Return JSON only, with no "buying_intention" values.
 
 Format:
 
