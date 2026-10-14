@@ -1341,22 +1341,55 @@ async function resetSourceCycle(
   source,
   niches
 ) {
-  const statusField =
-    SOURCE_STATUS_FIELD[source];
+  const statusField = SOURCE_STATUS_FIELD[source];
 
   const activeNiches = niches
     .filter(niche => niche.is_active !== false)
     .sort((a, b) => {
-      const timeA = Date.parse(
-        a.updated_at || a.created_at || ""
-      ) || 0;
+      const timeA =
+        Date.parse(a.updated_at || a.created_at || "") || 0;
 
-      const timeB = Date.parse(
-        b.updated_at || b.created_at || ""
-      ) || 0;
+      const timeB =
+        Date.parse(b.updated_at || b.created_at || "") || 0;
 
       if (timeA !== timeB) {
         return timeA - timeB;
       }
 
-      return
+      return String(a.id).localeCompare(String(b.id));
+    });
+
+  if (activeNiches.length === 0) {
+    console.log(
+      "No active niches available to reset:",
+      applicationId,
+      source
+    );
+    return;
+  }
+
+  for (const niche of activeNiches) {
+    await supabaseRequest(
+      env,
+      `/rest/v1/customer_niches?id=eq.${encodeURIComponent(niche.id)}`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "Prefer": "return=minimal"
+        },
+        body: JSON.stringify({
+          [statusField]: "pending"
+        })
+      }
+    );
+  }
+
+  console.log(
+    "Source cycle reset:",
+    source,
+    applicationId,
+    "Niches:",
+    activeNiches.length
+  );
+}
