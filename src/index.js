@@ -1012,13 +1012,49 @@ async function resetSourceCycle(
 // same niche status using this conditional PATCH.
 // ============================================================
 
-async function claimNicheStatus(
+async function resetSourceCycle(
   env,
-  niche,
-  source
+  applicationId,
+  source,
+  niches
 ) {
   const statusField = source + "_status";
 
-  const rows = await supabaseRequest(
-    env,
-    "/rest/v1/customer_n
+  // Confirm every active niche has completed this cycle.
+  for (const niche of niches) {
+    if (niche[statusField] !== "completed") {
+      throw new Error(
+        "Cannot reset cycle: not all niches are completed"
+      );
+    }
+  }
+
+  // Reset only the selected source's statuses.
+  // Keep the other source's statuses unchanged.
+  for (const niche of niches) {
+    await supabaseRequest(
+      env,
+      "/rest/v1/customer_niches" +
+        "?id=eq." + encodeURIComponent(niche.id) +
+        "&application_id=eq." +
+        encodeURIComponent(applicationId) +
+        "&" + statusField + "=eq.completed",
+      {
+        method: "PATCH",
+        headers: {
+          "Prefer": "return=representation"
+        },
+        body: {
+          [statusField]: "pending",
+          updated_at: new Date().toISOString()
+        }
+      }
+    );
+  }
+
+  console.log(
+    "Reset source cycle:",
+    source,
+    applicationId
+  );
+}
