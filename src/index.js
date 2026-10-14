@@ -1,777 +1,886 @@
-/**
- * ============================================================
- * REPORTLI AI — CUSTOMER NICHE PLANNER
- * Version 3.0.0
- * ============================================================
- *
- * EXISTING TABLES ONLY:
- *   applications
- *   customer_niches
- *   planner_runs
- *   users
- *   user_integrations
- *
- * REQUIRED SECRETS:
- *   SUPABASE_URL
- *   SUPABASE_SERVICE_ROLE_KEY
- *   SARVAM_API_KEY
- *
- * OPTIONAL SECRET:
- *   INTERNAL_WORKER_SECRET
- *
- * ENDPOINTS:
- *   GET  /health
- *   POST /webhook
- *   POST /test
- *   POST /create-task
- *
- * NO CRON TRIGGERS.
- * NO SQL MIGRATIONS.
- * NO NEW TABLES.
- *
- * SARVAM:
- *   1. Customer niche generation.
- *   2. Reddit task generation.
- *   3. Apollo task generation.
- * ============================================================
- */
+// ============================================================
+// REPORTLI AI — CUSTOMER NICHE PLANNER + TASK SCHEDULER
+// Version: 4.0.0
+//
+// Features:
+// 1. No Cron Trigger.
+// 2. No INTERNAL_WORKER_SECRET.
+// 3. Creates 10 customer niches using Sarvam AI.
+// 4. Assigns unique buying-intention scores.
+// 5. Accepts POST /create-task.
+// 6. Selects the highest-scoring pending niche.
+// 7. Keeps Reddit and Apollo queues independent.
+// 8. Saves tasks in planner_runs.
+// 9. Marks the selected niche as queued.
+// 10. Resets a source cycle after every niche is completed.
+//
+// Existing tables only:
+// applications
+// customer_niches
+// planner_runs
+// users
+// user_integrations
+// ============================================================
 
-const VERSION = "3.0.0";
+const VERSION = "4.0.0";
 
-const SARVAM_URL =
-  "https://api.sarvam.ai/v1/chat/completions";
+const SOURCES = {
+  REDDIT: "reddit",
+  APOLLO: "apollo"
+};
 
-const SARVAM_MODEL = "sarvam-105b";
+const SOURCE_STATUS_FIELD = {
+  reddit: "reddit_status",
+  apollo: "apollo_status"
+};
 
-const EXPECTED_NICHES = 10;
+const SOURCE_WORKER_TYPE = {
+  reddit: "reddit_research",
+  apollo: "apollo_lead_generation"
+};
 
-const MAX_COMPANY_CONTEXT_CHARS = 12000;
-
-const MAX_NICHES_PER_RUN = 50;
-
-const VALID_SOURCES = ["reddit", "apollo"];
-
-const VALID_STATUSES = [
-  "pending",
-  "processing",
-  "queued",
-  "completed",
-  "failed"
+// Unique descending scores.
+// These are relative ranking scores, not calibrated probabilities.
+const BUYING_INTENTION_SCORES = [
+  100, 97, 94, 91, 88,
+  85, 82, 79, 76, 73
 ];
 
+const ALLOWED_METHODS = ["GET", "POST", "OPTIONS"];
 
 // ============================================================
-// MAIN ENTRY POINT
+// MAIN REQUEST HANDLER
 // ============================================================
 
 export default {
   async fetch(request, env) {
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Content-Type": "application/json; charset=utf-8"
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders
+      });
+    }
+
     const url = new URL(request.url);
+    const pathname = url.pathname.replace(/\/+$/, "") || "/";
+
+    if (!ALLOWED_METHODS.includes(request.method)) {
+      return jsonResponse(
+        { success: false, error: "Method not allowed" },
+        405,
+        corsHeaders
+      );
+    }
 
     try {
-      if (
-        request.method === "GET" &&
-        url.pathname === "/health"
-      ) {
-        return json({
-          ok: true,
-          worker: "reportli-customer-niche-planner",
-          version: VERSION,
-          cron_enabled: false,
-          timestamp: new Date().toISOString()
-        });
+      validateEnvironment(env);
+
+      // --------------------------------------------------------
+      // HEALTH CHECK
+      // GET /health
+      // --------------------------------------------------------
+
+      if (pathname === "/health" && request.method === "GET") {
+        return jsonResponse(
+          {
+            success: true,
+            worker: "reportli-customer-niche-planner",
+            version: VERSION,
+            cron_enabled: false,
+            authentication_required: false,
+            endpoints: [
+              "GET /health",
+              "POST /webhook",
+              "POST /create-task",
+              "POST /test"
+            ]
+          },
+          200,
+          corsHeaders
+        );
       }
 
-      if (
-        request.method === "POST" &&
-        url.pathname === "/webhook"
-      ) {
-        return await handleWebhook(request, env);
-      }
+      // --------------------------------------------------------
+      // CREATE NEXT SOURCE TASK
+      // POST /create-task
+      //
+      // {
+      //   "application_id": "YOUR_APPLICATION_ID",
+      //   "source": "reddit"
+      // }
+      // --------------------------------------------------------
 
       if (
-        request.method === "POST" &&
-        url.pathname === "/create-task"
+        pathname === "/create-task" &&
+        request.method === "POST"
       ) {
-        return await handleCreateTask(request, env);
+        const body = await readJsonBody(request);
+
+        const applicationId = String(
+          body.application_id || ""
+        ).trim();
+
+        const source = normalizeSource(body.source);
+
+        if (!applicationId) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "application_id is required"
+            },
+            400,
+            corsHeaders
+          );
+        }
+
+        if (!source) {
+          return jsonResponse(
+            {
+              success: false,
+              error: 'source must be "reddit" or "apollo"'
+            },
+            400,
+            corsHeaders
+          );
+        }
+
+        const result = await createNextNicheTask(
+          env,
+          applicationId,
+          source
+        );
+
+        return jsonResponse(
+          result,
+          result.success ? 200 : (result.http_status || 500),
+          corsHeaders
+        );
       }
+
+      // --------------------------------------------------------
+      // APPLICATION WEBHOOK
+      //
+      // Supports a Supabase Database Webhook payload:
+      // { "record": { "id": "APPLICATION_ID" } }
+      //
+      // Also supports:
+      // { "application_id": "APPLICATION_ID" }
+      // --------------------------------------------------------
 
       if (
-        request.method === "POST" &&
-        url.pathname === "/test"
+        pathname === "/webhook" &&
+        request.method === "POST"
       ) {
-        return await handleManualTest(request, env);
+        const body = await readJsonBody(request);
+
+        const applicationId = String(
+          body.application_id ||
+          body.record?.id ||
+          body.id ||
+          ""
+        ).trim();
+
+        if (!applicationId) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Application ID missing. Provide application_id or record.id."
+            },
+            400,
+            corsHeaders
+          );
+        }
+
+        const result = await processApplication(
+          env,
+          applicationId
+        );
+
+        return jsonResponse(
+          result,
+          result.success ? 200 : (result.http_status || 500),
+          corsHeaders
+        );
       }
 
-      return json({
-        ok: false,
-        error:
-          "Use GET /health, POST /webhook, " +
-          "POST /create-task, or POST /test"
-      }, 404);
+      // --------------------------------------------------------
+      // MANUAL TEST ENDPOINT
+      // POST /test
+      //
+      // Uses the same payload as /create-task.
+      // --------------------------------------------------------
 
+      if (
+        pathname === "/test" &&
+        request.method === "POST"
+      ) {
+        const body = await readJsonBody(request);
+
+        const applicationId = String(
+          body.application_id || ""
+        ).trim();
+
+        const source = normalizeSource(body.source);
+
+        if (!applicationId || !source) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                'Provide application_id and source ("reddit" or "apollo").'
+            },
+            400,
+            corsHeaders
+          );
+        }
+
+        const result = await createNextNicheTask(
+          env,
+          applicationId,
+          source
+        );
+
+        return jsonResponse(
+          result,
+          result.success ? 200 : (result.http_status || 500),
+          corsHeaders
+        );
+      }
+
+      return jsonResponse(
+        {
+          success: false,
+          error: "Endpoint not found",
+          available_endpoints: [
+            "GET /health",
+            "POST /webhook",
+            "POST /create-task",
+            "POST /test"
+          ]
+        },
+        404,
+        corsHeaders
+      );
     } catch (error) {
       console.error("Worker request failed:", error);
 
-      return json({
-        ok: false,
-        error: error.message || "Internal server error"
-      }, 500);
+      return jsonResponse(
+        {
+          success: false,
+          error: error.message || "Internal server error"
+        },
+        500,
+        corsHeaders
+      );
     }
   }
 };
 
-
 // ============================================================
-// OPTIONAL INTERNAL WORKER AUTHENTICATION
-//
-// Set INTERNAL_WORKER_SECRET in Cloudflare Worker secrets.
-// Other Workers must send:
-//
-// Authorization: Bearer YOUR_INTERNAL_WORKER_SECRET
-//
-// If the secret is not configured, these endpoints remain
-// accessible without this authentication check.
+// RESPONSE HELPERS
 // ============================================================
 
-function authorizeInternalRequest(request, env) {
-  if (!env.INTERNAL_WORKER_SECRET) {
-    return true;
-  }
-
-  const authorization =
-    request.headers.get("Authorization") || "";
-
-  return authorization ===
-    "Bearer " + env.INTERNAL_WORKER_SECRET;
-}
-
-
-// ============================================================
-// MANUAL TEST ENDPOINT
-//
-// POST /test
-//
-// {
-//   "action": "test_task_creation",
-//   "application_id": "YOUR_APPLICATION_ID",
-//   "source": "reddit"
-// }
-//
-// source can be "reddit" or "apollo".
-// ============================================================
-
-async function handleManualTest(request, env) {
-  if (!authorizeInternalRequest(request, env)) {
-    return json({
-      ok: false,
-      error: "Unauthorized"
-    }, 401);
-  }
-
-  const body = await readJsonBody(request);
-
-  if (body.action !== "test_task_creation") {
-    return json({
-      ok: false,
-      error: "action must be test_task_creation"
-    }, 400);
-  }
-
-  if (!body.application_id) {
-    return json({
-      ok: false,
-      error: "application_id is required"
-    }, 400);
-  }
-
-  const source = normalizeSource(body.source);
-
-  if (!source) {
-    return json({
-      ok: false,
-      error: "source must be reddit or apollo"
-    }, 400);
-  }
-
-  const result = await createNextNicheTask(
-    env,
-    String(body.application_id),
-    source
-  );
-
-  return json({
-    ok: true,
-    mode: "manual_test",
-    ...result
+function jsonResponse(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers
   });
 }
 
+async function readJsonBody(request) {
+  const text = await request.text();
 
-// ============================================================
-// APPLICATION WEBHOOK
-//
-// Receives a Supabase Database Webhook for applications.
-//
-// IMPORTANT:
-// Processes the exact application in the webhook rather
-// than selecting an unrelated pending application.
-// ============================================================
-
-async function handleWebhook(request, env) {
-  const body = await readJsonBody(request);
-
-  const eventType = String(
-    body.type || body.event || ""
-  ).toUpperCase();
-
-  if (
-    eventType &&
-    !eventType.includes("INSERT")
-  ) {
-    return json({
-      ok: true,
-      skipped: true,
-      reason: "Not an INSERT event"
-    });
-  }
-
-  const record =
-    body.record ||
-    body.application ||
-    body;
-
-  if (!record || !record.id) {
-    return json({
-      ok: false,
-      error: "Application record with id is required"
-    }, 400);
-  }
-
-  // Use the exact record supplied by the webhook.
-  const app = await getApplication(
-    env,
-    String(record.id)
-  );
-
-  if (!app) {
-    return json({
-      ok: false,
-      error: "Application not found"
-    }, 404);
-  }
-
-  // Avoid regenerating niches for completed applications.
-  if (app.planner_status === "completed") {
-    const existing = await getNiches(env, app.id);
-
-    if (existing.length >= EXPECTED_NICHES) {
-      return json({
-        ok: true,
-        skipped: true,
-        reason: "Niches already generated",
-        application_id: app.id,
-        niches_found: existing.length
-      });
-    }
-  }
-
-  // Atomically claim the application's pending status.
-  const claimed = await claimApplication(
-    env,
-    app.id
-  );
-
-  if (!claimed) {
-    return json({
-      ok: true,
-      processed: false,
-      message:
-        "Application is already processing, " +
-        "or is not pending",
-      application_id: app.id
-    });
+  if (!text.trim()) {
+    throw new Error("Request body is empty");
   }
 
   try {
-    const result = await processApplication(
-      env,
-      claimed
-    );
-
-    return json({
-      ok: true,
-      ...result
-    });
-
-  } catch (error) {
-    console.error(
-      "Niche generation failed:",
-      claimed.id,
-      error
-    );
-
-    await updateApplicationStatus(
-      env,
-      claimed.id,
-      "failed"
-    );
-
-    return json({
-      ok: false,
-      application_id: claimed.id,
-      error: error.message
-    }, 500);
+    return JSON.parse(text);
+  } catch {
+    throw new Error("Request body must contain valid JSON");
   }
 }
 
+function normalizeSource(value) {
+  const source = String(value || "")
+    .trim()
+    .toLowerCase();
 
-// ============================================================
-// CLAIM APPLICATION
-// ============================================================
+  if (source === SOURCES.REDDIT) return SOURCES.REDDIT;
+  if (source === SOURCES.APOLLO) return SOURCES.APOLLO;
 
-async function claimApplication(env, applicationId) {
-  const rows = await supabaseRequest(
-    env,
-    "/rest/v1/applications" +
-      "?id=eq." + encodeURIComponent(applicationId) +
-      "&planner_status=eq.pending",
-    {
-      method: "PATCH",
-      headers: {
-        "Prefer": "return=representation"
-      },
-      body: {
-        planner_status: "processing"
-      }
-    }
-  );
-
-  return rows[0] || null;
+  return null;
 }
 
-
-// ============================================================
-// PROCESS APPLICATION
-//
-// Generates exactly 10 customer niches, saves them,
-// creates a completion record, and completes the application.
-// ============================================================
-
-async function processApplication(env, app) {
-  const existing = await getNiches(env, app.id);
-
-  if (existing.length >= EXPECTED_NICHES) {
-    await updateApplicationStatus(
-      env,
-      app.id,
-      "completed"
-    );
-
-    return {
-      application_id: app.id,
-      niches_found: existing.length,
-      planner_status: "completed"
-    };
-  }
-
-  const companyContext = JSON.stringify({
-    application_id: app.id,
-    company_name: app.company || app.name || "",
-    application_name: app.name || "",
-    domain: app.domain || ""
-  }).slice(0, MAX_COMPANY_CONTEXT_CHARS);
-
-  const generated = await generateCustomerNiches(
-    env,
-    companyContext
-  );
-
-  const niches = validateNiches(generated);
-
-  const saved = await saveNiches(
-    env,
-    app,
-    niches
-  );
-
-  if (saved.length !== EXPECTED_NICHES) {
-    throw new Error(
-      "Expected exactly 10 saved customer niches; found " +
-      saved.length
-    );
-  }
-
-  await createCompletionRecord(
-    env,
-    app,
-    "Analyze the company and find 10 customer niches"
-  );
-
-  await updateApplicationStatus(
-    env,
-    app.id,
-    "completed"
-  );
-
-  return {
-    application_id: app.id,
-    niches_saved: saved.length,
-    planner_status: "completed",
-    message:
-      "Analyze the company and find 10 customer niches"
-  };
-}
-
-
-// ============================================================
-// SARVAM AI — GENERATE CUSTOMER NICHES
-//
-// AI supplies niche names and relative ranking scores.
-// We normalize the scores to unique percentages afterward.
-// ============================================================
-
-async function generateCustomerNiches(
-  env,
-  companyContext
-) {
-  const parsed = await callSarvamJson(
-    env,
-    [
-      {
-        role: "system",
-        content:
-          "You are a B2B market research strategist. " +
-          "Analyze the company and identify exactly 10 " +
-          "distinct, specific customer niches that could " +
-          "realistically buy its products or services. " +
-          "Rank them from strongest to weakest buying potential. " +
-          "Return JSON only in this shape: " +
-          '{"niches":[{"niche_name":"Specific customer segment",' +
-          '"buying_intention":10}]}. ' +
-          "buying_intention must be a relative ranking score " +
-          "from 1 to 10, where 10 is the strongest. " +
-          "Do not repeat niche names. Do not invent company facts. " +
-          "Do not return generic segments such as everyone."
-      },
-      {
-        role: "user",
-        content:
-          "Company context:\n" + companyContext
-      }
-    ],
-    4096
-  );
-
-  if (!Array.isArray(parsed.niches)) {
-    throw new Error(
-      "Sarvam response has no niches array"
-    );
-  }
-
-  return parsed.niches;
-}
-
-
-// ============================================================
-// VALIDATE NICHE OUTPUT
-//
-// Scores are converted to distinct percentages.
-//
-// Strongest niche: 100%
-// Remaining niches: 97%, 94%, 91%, etc.
-//
-// These are estimated relative buying-potential scores,
-// not measured probabilities of an actual purchase.
-// ============================================================
-
-function validateNiches(niches) {
-  const unique = new Map();
-
-  for (const item of niches) {
-    if (typeof item?.niche_name !== "string") {
-      continue;
-    }
-
-    const name = item.niche_name.trim();
-
-    const score = Number(item.buying_intention);
-
-    if (
-      !name ||
-      !Number.isFinite(score)
-    ) {
-      continue;
-    }
-
-    const key = name.toLowerCase();
-
-    if (!unique.has(key)) {
-      unique.set(key, {
-        niche_name: name,
-        raw_score: score
-      });
-    }
-  }
-
-  const result = Array.from(unique.values());
-
-  if (result.length !== EXPECTED_NICHES) {
-    throw new Error(
-      "Expected 10 unique valid niches; received " +
-      result.length
-    );
-  }
-
-  // Sort by AI score, preserving the strongest niche first.
-  result.sort((a, b) => b.raw_score - a.raw_score);
-
-  // Assign deterministic, unique percentages.
-  // All scores are distinct and remain within 0–100.
-  const percentages = [
-    100, 97, 94, 91, 88,
-    85, 82, 79, 76, 73
+function validateEnvironment(env) {
+  const required = [
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "SARVAM_API_KEY"
   ];
 
-  return result.map((item, index) => ({
-    niche_name: item.niche_name,
-    buying_intention: percentages[index]
-  }));
-}
-
-
-// ============================================================
-// READ CUSTOMER NICHES
-// ============================================================
-
-async function getNiches(env, applicationId) {
-  return await supabaseRequest(
-    env,
-    "/rest/v1/customer_niches" +
-      "?select=*" +
-      "&application_id=eq." +
-      encodeURIComponent(applicationId) +
-      "&order=created_at.asc"
-  );
-}
-
-
-// ============================================================
-// SAVE CUSTOMER NICHES
-// ============================================================
-
-async function saveNiches(env, app, generated) {
-  const existing = await getNiches(env, app.id);
-
-  const names = new Set(
-    existing.map(row =>
-      String(row.niche_name || "")
-        .trim()
-        .toLowerCase()
-    )
+  const missing = required.filter(
+    key => !env[key] || !String(env[key]).trim()
   );
 
-  const saved = [...existing];
+  if (missing.length > 0) {
+    throw new Error(
+      "Missing Cloudflare Worker environment variables: " +
+      missing.join(", ")
+    );
+  }
+}
 
-  for (const niche of generated) {
-    if (saved.length >= EXPECTED_NICHES) {
-      break;
-    }
+// ============================================================
+// SUPABASE REST API HELPER
+// ============================================================
 
-    const key = niche.niche_name.toLowerCase();
+async function supabaseRequest(
+  env,
+  path,
+  options = {}
+) {
+  const baseUrl = env.SUPABASE_URL.replace(/\/+$/, "");
+  const url = baseUrl + "/rest/v1" + path;
 
-    if (names.has(key)) {
-      continue;
-    }
+  const headers = {
+    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization":
+      "Bearer " + env.SUPABASE_SERVICE_ROLE_KEY,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    ...(options.headers || {})
+  };
 
-    const rows = await supabaseRequest(
-      env,
-      "/rest/v1/customer_niches",
-      {
-        method: "POST",
-        headers: {
-          "Prefer": "return=representation"
-        },
-        body: {
-          application_id: String(app.id),
-          niche_name: niche.niche_name,
-          buying_intention: niche.buying_intention,
-          reddit_status: "pending",
-          apollo_status: "pending",
-          is_active: true,
-          user_id: app.user_id || null
-        }
-      }
+  const fetchOptions = {
+    method: options.method || "GET",
+    headers
+  };
+
+  if (options.body !== undefined) {
+    fetchOptions.body = JSON.stringify(options.body);
+  }
+
+  const response = await fetch(url, fetchOptions);
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    console.error(
+      "Supabase REST error:",
+      response.status,
+      responseText
     );
 
-    if (!rows.length) {
-      throw new Error(
-        "Inserted niche was not returned by Supabase"
-      );
-    }
-
-    saved.push(rows[0]);
-    names.add(key);
+    throw new Error(
+      "Supabase request failed (" +
+      response.status +
+      "): " +
+      responseText.slice(0, 1200)
+    );
   }
 
-  return saved;
+  if (!responseText.trim()) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    return responseText;
+  }
 }
 
-
 // ============================================================
-// CREATE NICHE ANALYSIS COMPLETION RECORD
+// SARVAM AI HELPER
 // ============================================================
 
-async function createCompletionRecord(
+async function callSarvamJson(
   env,
-  app,
-  details
+  systemPrompt,
+  userPrompt,
+  maxTokens = 3000
 ) {
-  const task =
-    "Analyze the company and find 10 customer niches. " +
-    "Company: " +
-    String(app.company || app.name || app.id) +
-    ". " +
-    "Result: " + details +
-    ". Completed at: " +
-    new Date().toISOString();
-
-  const existing = await supabaseRequest(
-    env,
-    "/rest/v1/planner_runs" +
-      "?select=id" +
-      "&application_id=eq." +
-      encodeURIComponent(String(app.id)) +
-      "&worker_type=eq.planner" +
-      "&source=eq.system" +
-      "&task=ilike." +
-      encodeURIComponent(
-        "Analyze the company and find 10 customer niches%"
-      ) +
-      "&limit=1"
-  );
-
-  if (existing.length) {
-    return existing[0];
-  }
-
-  const rows = await supabaseRequest(
-    env,
-    "/rest/v1/planner_runs",
+  const response = await fetch(
+    "https://api.sarvam.ai/v1/chat/completions",
     {
       method: "POST",
       headers: {
-        "Prefer": "return=representation"
+        "api-subscription-key": env.SARVAM_API_KEY,
+        "Content-Type": "application/json"
       },
-      body: {
-        application_id: String(app.id),
-        user_id: app.user_id || null,
-        worker_type: "planner",
-        source: "system",
-        task,
-        pending_count: 0,
-        error: null,
-        niche: null
-      }
+      body: JSON.stringify({
+        model: "sarvam-105b",
+        temperature: 0.2,
+        max_tokens: maxTokens,
+        response_format: {
+          type: "json_object"
+        },
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: userPrompt
+          }
+        ]
+      })
     }
   );
 
-  if (!rows.length) {
-    throw new Error(
-      "Could not create niche analysis completion record"
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    console.error(
+      "Sarvam API error:",
+      response.status,
+      responseText
     );
+
+    throw new Error(
+      "Sarvam API failed (" +
+      response.status +
+      "): " +
+      responseText.slice(0, 1200)
+    );
+  }
+
+  let responseJson;
+
+  try {
+    responseJson = JSON.parse(responseText);
+  } catch {
+    throw new Error("Sarvam returned an invalid API response");
+  }
+
+  const content =
+    responseJson.choices?.[0]?.message?.content;
+
+  if (!content) {
+    throw new Error("Sarvam returned an empty response");
+  }
+
+  if (typeof content === "object") {
+    return content;
+  }
+
+  try {
+    return JSON.parse(content);
+  } catch {
+    const cleaned = String(content)
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/, "")
+      .trim();
+
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      throw new Error(
+        "Sarvam did not return valid JSON: " +
+        cleaned.slice(0, 500)
+      );
+    }
+  }
+}
+
+// ============================================================
+// GET APPLICATION
+// ============================================================
+
+async function getApplication(env, applicationId) {
+  const query =
+    "?id=eq." +
+    encodeURIComponent(applicationId) +
+    "&select=*";
+
+  const rows = await supabaseRequest(
+    env,
+    "/applications" + query
+  );
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return null;
   }
 
   return rows[0];
 }
 
-
 // ============================================================
-// CREATE TASK ENDPOINT
-//
-// POST /create-task
-//
-// Request body:
-// {
-//   "application_id": "YOUR_APPLICATION_ID",
-//   "source": "reddit"
-// }
-//
-// OR:
-// {
-//   "application_id": "YOUR_APPLICATION_ID",
-//   "source": "apollo"
-// }
-//
-// Creates one task for the next eligible niche.
+// APPLICATION WEBHOOK PROCESSING
 // ============================================================
 
-async function handleCreateTask(request, env) {
-  if (!authorizeInternalRequest(request, env)) {
-    return json({
-      ok: false,
-      error: "Unauthorized"
-    }, 401);
-  }
-
-  const body = await readJsonBody(request);
-
-  if (!body.application_id) {
-    return json({
-      ok: false,
-      error: "application_id is required"
-    }, 400);
-  }
-
-  const source = normalizeSource(body.source);
-
-  if (!source) {
-    return json({
-      ok: false,
-      error: "source must be reddit or apollo"
-    }, 400);
-  }
-
-  const result = await createNextNicheTask(
+async function processApplication(
+  env,
+  applicationId
+) {
+  const application = await getApplication(
     env,
-    String(body.application_id),
-    source
+    applicationId
   );
 
-  return json({
-    ok: true,
-    ...result
+  if (!application) {
+    return {
+      success: false,
+      http_status: 404,
+      error: "Application not found",
+      application_id: applicationId
+    };
+  }
+
+  const existingNiches = await getCustomerNiches(
+    env,
+    applicationId
+  );
+
+  if (existingNiches.length >= 10) {
+    await updateApplicationStatus(
+      env,
+      applicationId,
+      "completed"
+    );
+
+    return {
+      success: true,
+      message:
+        "Analyze the company and find 10 customer niches",
+      application_id: applicationId,
+      niches_count: existingNiches.length,
+      already_created: true
+    };
+  }
+
+  try {
+    const generated = await generateCustomerNiches(
+      env,
+      application
+    );
+
+    const saved = await saveCustomerNiches(
+      env,
+      application,
+      generated.niches
+    );
+
+    const finalNiches = await getCustomerNiches(
+      env,
+      applicationId
+    );
+
+    if (finalNiches.length < 10) {
+      throw new Error(
+        "Only " +
+        finalNiches.length +
+        " niches exist after saving. Expected 10."
+      );
+    }
+
+    await updateApplicationStatus(
+      env,
+      applicationId,
+      "completed"
+    );
+
+    return {
+      success: true,
+      message:
+        "Analyze the company and find 10 customer niches",
+      application_id: applicationId,
+      niches_count: finalNiches.length,
+      newly_saved: saved,
+      niches: finalNiches.map(niche => ({
+        id: niche.id,
+        niche_name: niche.niche_name,
+        buying_intention: niche.buying_intention
+      }))
+    };
+  } catch (error) {
+    console.error(
+      "Application niche processing failed:",
+      error
+    );
+
+    await updateApplicationStatus(
+      env,
+      applicationId,
+      "failed"
+    );
+
+    throw error;
+  }
+}
+
+// ============================================================
+// UPDATE APPLICATION STATUS
+// ============================================================
+
+async function updateApplicationStatus(
+  env,
+  applicationId,
+  status
+) {
+  await supabaseRequest(
+    env,
+    "/applications?id=eq." +
+      encodeURIComponent(applicationId),
+    {
+      method: "PATCH",
+      headers: {
+        "Prefer": "return=minimal"
+      },
+      body: {
+        planner_status: status
+      }
+    }
+  );
+}
+
+// ============================================================
+// GET CUSTOMER NICHES
+// ============================================================
+
+async function getCustomerNiches(
+  env,
+  applicationId
+) {
+  const query =
+    "?application_id=eq." +
+    encodeURIComponent(applicationId) +
+    "&select=*" +
+    "&order=buying_intention.desc,created_at.asc";
+
+  const rows = await supabaseRequest(
+    env,
+    "/customer_niches" + query
+  );
+
+  if (!Array.isArray(rows)) {
+    return [];
+  }
+
+  return rows;
+}
+
+// ============================================================
+// GENERATE 10 CUSTOMER NICHES WITH SARVAM
+// ============================================================
+
+async function generateCustomerNiches(
+  env,
+  application
+) {
+  const companyInfo = {
+    application_name: application.name || "",
+    company: application.company || "",
+    domain: application.domain || "",
+    description:
+      application.description ||
+      application.company_description ||
+      "",
+    industry: application.industry || "",
+    target_audience:
+      application.target_audience || "",
+    existing_data: {
+      website: application.website || "",
+      business_type: application.business_type || ""
+    }
+  };
+
+  const systemPrompt = `
+You are an expert B2B customer research strategist.
+
+Your task is to discover exactly 10 distinct customer niches
+for the supplied company.
+
+Rules:
+1. Return valid JSON only.
+2. Do not invent company facts.
+3. Niches must be meaningfully different.
+4. Prefer specific customer segments with clear problems.
+5. Estimate relative buying intention, not a guaranteed probability.
+6. Return exactly 10 niches.
+7. Each niche must have a unique integer buying_intention.
+8. buying_intention must be between 1 and 100.
+9. Sort niches from highest buying intention to lowest.
+10. Do not include markdown.
+
+Use this JSON shape:
+{
+  "niches": [
+    {
+      "niche_name": "Specific customer segment",
+      "description": "Why this segment is relevant",
+      "pain_points": ["Pain point 1", "Pain point 2"],
+      "buying_reason": "Why they might buy this company's product"
+    }
+  ]
+}
+`;
+
+  const userPrompt = `
+Analyze this company and identify exactly 10 customer niches.
+
+Company information:
+${JSON.stringify(companyInfo, null, 2)}
+
+Return the 10 best customer niches in JSON.
+`;
+
+  const result = await callSarvamJson(
+    env,
+    systemPrompt,
+    userPrompt,
+    4000
+  );
+
+  if (!Array.isArray(result.niches)) {
+    throw new Error(
+      "Sarvam did not return a niches array"
+    );
+  }
+
+  if (result.niches.length < 10) {
+    throw new Error(
+      "Sarvam returned fewer than 10 niches"
+    );
+  }
+
+  const unique = [];
+  const seen = new Set();
+
+  for (const item of result.niches) {
+    const name = String(
+      item.niche_name || ""
+    ).trim();
+
+    const normalized = name.toLowerCase();
+
+    if (!name || seen.has(normalized)) {
+      continue;
+    }
+
+    seen.add(normalized);
+
+    unique.push({
+      niche_name: name,
+      description: String(
+        item.description || ""
+      ).trim(),
+      pain_points: Array.isArray(item.pain_points)
+        ? item.pain_points.map(String)
+        : [],
+      buying_reason: String(
+        item.buying_reason || ""
+      ).trim()
+    });
+
+    if (unique.length === 10) {
+      break;
+    }
+  }
+
+  if (unique.length !== 10) {
+    throw new Error(
+      "Could not obtain 10 unique customer niches"
+    );
+  }
+
+  // Assign fixed unique descending scores to ensure
+  // stable ranking even if Sarvam returns repeated scores.
+  unique.forEach((niche, index) => {
+    niche.buying_intention =
+      BUYING_INTENTION_SCORES[index];
   });
+
+  return {
+    niches: unique
+  };
 }
 
-
 // ============================================================
-// NORMALIZE SOURCE
+// SAVE CUSTOMER NICHES
+//
+// No new tables and no SQL migrations.
+// Existing niches are preserved.
 // ============================================================
 
-function normalizeSource(source) {
-  const value = String(source || "")
-    .trim()
-    .toLowerCase();
+async function saveCustomerNiches(
+  env,
+  application,
+  niches
+) {
+  const applicationId = application.id;
 
-  return VALID_SOURCES.includes(value)
-    ? value
-    : null;
+  const existing = await getCustomerNiches(
+    env,
+    applicationId
+  );
+
+  const existingNames = new Set(
+    existing.map(niche =>
+      String(niche.niche_name || "")
+        .trim()
+        .toLowerCase()
+    )
+  );
+
+  let savedCount = 0;
+
+  for (let i = 0; i < niches.length; i++) {
+    const niche = niches[i];
+
+    const normalizedName =
+      niche.niche_name.toLowerCase();
+
+    if (existingNames.has(normalizedName)) {
+      continue;
+    }
+
+    const now = new Date().toISOString();
+
+    const row = {
+      application_id: applicationId,
+      user_id: application.user_id || null,
+      niche_name: niche.niche_name,
+      buying_intention:
+        BUYING_INTENTION_SCORES[i],
+      reddit_status: "pending",
+      apollo_status: "pending",
+      is_active: true,
+      created_at: now,
+      updated_at: now
+    };
+
+    await supabaseRequest(
+      env,
+      "/customer_niches",
+      {
+        method: "POST",
+        headers: {
+          "Prefer": "return=minimal"
+        },
+        body: row
+      }
+    );
+
+    existingNames.add(normalizedName);
+    savedCount++;
+  }
+
+  return savedCount;
 }
 
-
 // ============================================================
-// CREATE THE NEXT NICHE TASK
-//
-// Selection rules:
-//
-// 1. Only active niches are eligible.
-// 2. Completed and queued niches are not eligible.
-// 3. Choose highest buying_intention first.
-// 4. After all 10 niches complete, reset that source.
-// 5. At the beginning of the next cycle, start with the
-//    niche whose updated_at is oldest.
-// 6. Reddit and Apollo are independent queues.
+// CREATE NEXT TASK FOR A SOURCE
 // ============================================================
 
 async function createNextNicheTask(
@@ -779,180 +888,451 @@ async function createNextNicheTask(
   applicationId,
   source
 ) {
-  const app = await getApplication(
+  const application = await getApplication(
     env,
     applicationId
   );
 
-  if (!app) {
-    throw new Error(
-      "Application not found: " + applicationId
-    );
-  }
-
-  if (app.planner_status !== "completed") {
-    throw new Error(
-      "Customer niche analysis is not completed"
-    );
-  }
-
-  let niches = await getActiveNiches(
-    env,
-    applicationId
-  );
-
-  if (!niches.length) {
-    throw new Error(
-      "No active customer niches found"
-    );
-  }
-
-  const statusField = source + "_status";
-
-  // Do not reset a cycle while a task is still in progress.
-  const unfinished = niches.some(niche =>
-    ["processing", "queued"].includes(
-      String(niche[statusField] || "")
-    )
-  );
-
-  const allCompleted = niches.length >= EXPECTED_NICHES &&
-    niches.every(niche =>
-      niche[statusField] === "completed"
-    );
-
-  let cycleReset = false;
-
-  if (allCompleted) {
-    await resetSourceCycle(
-      env,
-      applicationId,
-      source,
-      niches
-    );
-
-    cycleReset = true;
-
-    niches = await getActiveNiches(
-      env,
-      applicationId
-    );
-  } else if (unfinished) {
-    // There may be another task already queued or processing.
-    // This request should not create another task until that
-    // task's downstream Worker completes.
+  if (!application) {
     return {
-      application_id: applicationId,
-      source,
-      created: false,
-      reason:
-        "A task for this source is already queued or processing",
-      cycle_reset: false
+      success: false,
+      http_status: 404,
+      error: "Application not found",
+      application_id: applicationId
     };
   }
 
-  // After a reset, the oldest updated_at niche gets priority.
-  if (cycleReset) {
-    niches.sort((a, b) =>
-      dateValue(a.updated_at) - dateValue(b.updated_at)
+  let niches = await getCustomerNiches(
+    env,
+    applicationId
+  );
+
+  if (niches.length === 0) {
+    return {
+      success: false,
+      http_status: 409,
+      error:
+        "No customer niches exist. Run POST /webhook first.",
+      application_id: applicationId
+    };
+  }
+
+  const statusField =
+    SOURCE_STATUS_FIELD[source];
+
+  // A niche with status pending is eligible.
+  // Other queued/processing tasks do not prevent this
+  // request from selecting the next pending niche.
+  let pending = niches.filter(niche =>
+    String(niche[statusField] || "pending")
+      .toLowerCase() === "pending" &&
+    niche.is_active !== false
+  );
+
+  // If all niches are completed for this source,
+  // reset the cycle and begin again from the oldest
+  // updated_at niche.
+  if (pending.length === 0) {
+    const allCompleted = niches.every(niche =>
+      String(niche[statusField] || "pending")
+        .toLowerCase() === "completed" ||
+      niche.is_active === false
     );
-  } else {
-    // In a normal cycle, highest buying intention first.
-    niches.sort((a, b) =>
+
+    if (allCompleted) {
+      await resetSourceCycle(
+        env,
+        applicationId,
+        source,
+        niches
+      );
+
+      niches = await getCustomerNiches(
+        env,
+        applicationId
+      );
+
+      pending = niches.filter(niche =>
+        String(niche[statusField] || "pending")
+          .toLowerCase() === "pending" &&
+        niche.is_active !== false
+      );
+    }
+  }
+
+  if (pending.length === 0) {
+    const inProgress = niches.filter(niche => {
+      const status = String(
+        niche[statusField] || "pending"
+      ).toLowerCase();
+
+      return status === "queued" ||
+        status === "processing";
+    });
+
+    if (inProgress.length > 0) {
+      return {
+        success: false,
+        http_status: 409,
+        error:
+          "No pending niches remain for this source. " +
+          "Some tasks are still queued or processing.",
+        source,
+        in_progress_count: inProgress.length
+      };
+    }
+
+    return {
+      success: false,
+      http_status: 409,
+      error:
+        "No eligible niches are available for this source.",
+      source
+    };
+  }
+
+  // Highest buying intention first.
+  pending.sort((a, b) => {
+    const scoreDifference =
       Number(b.buying_intention || 0) -
-      Number(a.buying_intention || 0)
-    );
-  }
+      Number(a.buying_intention || 0);
 
-  // Select only one pending niche.
-  const selected = niches.find(niche =>
-    niche.is_active === true &&
-    niche[statusField] === "pending"
-  );
+    if (scoreDifference !== 0) {
+      return scoreDifference;
+    }
 
-  if (!selected) {
-    return {
-      application_id: applicationId,
-      source,
-      created: false,
-      cycle_reset: cycleReset,
-      reason:
-        "No eligible pending niche is available"
-    };
-  }
+    const timeA = Date.parse(
+      a.updated_at || a.created_at || ""
+    ) || 0;
 
-  const result = await queueNicheTask(
+    const timeB = Date.parse(
+      b.updated_at || b.created_at || ""
+    ) || 0;
+
+    if (timeA !== timeB) {
+      return timeA - timeB;
+    }
+
+    return String(a.id).localeCompare(String(b.id));
+  });
+
+  const selectedNiche = pending[0];
+
+  return queueNicheTask(
     env,
-    app,
-    selected,
+    application,
+    selectedNiche,
     source
   );
-
-  return {
-    application_id: applicationId,
-    source,
-    cycle_reset: cycleReset,
-    niche_id: selected.id,
-    niche_name: selected.niche_name,
-    buying_intention: selected.buying_intention,
-    ...result
-  };
 }
 
-
 // ============================================================
-// DATE HELPER
-// ============================================================
-
-function dateValue(value) {
-  const parsed = Date.parse(value || "");
-
-  return Number.isFinite(parsed)
-    ? parsed
-    : 0;
-}
-
-
-// ============================================================
-// GET APPLICATION
+// CLAIM NICHE, GENERATE TASK, SAVE TASK, MARK QUEUED
 // ============================================================
 
-async function getApplication(env, applicationId) {
-  const rows = await supabaseRequest(
+async function queueNicheTask(
+  env,
+  application,
+  niche,
+  source
+) {
+  const statusField =
+    SOURCE_STATUS_FIELD[source];
+
+  const applicationId = application.id;
+  const now = new Date().toISOString();
+
+  // Claim the niche conditionally.
+  // Only one request can successfully change pending
+  // to processing if the database update is atomic.
+  const claimed = await supabaseRequest(
     env,
-    "/rest/v1/applications" +
-      "?select=id,name,company,domain,user_id,planner_status" +
-      "&id=eq." + encodeURIComponent(applicationId) +
-      "&limit=1"
-  );
-
-  return rows[0] || null;
-}
-
-
-// ============================================================
-// GET ACTIVE NICHES
-// ============================================================
-
-async function getActiveNiches(env, applicationId) {
-  return await supabaseRequest(
-    env,
-    "/rest/v1/customer_niches" +
-      "?select=*" +
+    "/customer_niches?id=eq." +
+      encodeURIComponent(niche.id) +
       "&application_id=eq." +
       encodeURIComponent(applicationId) +
-      "&is_active=eq.true" +
-      "&order=created_at.asc" +
-      "&limit=" + MAX_NICHES_PER_RUN
+      "&" + statusField + "=eq.pending",
+    {
+      method: "PATCH",
+      headers: {
+        "Prefer": "return=representation"
+      },
+      body: {
+        [statusField]: "processing",
+        updated_at: now
+      }
+    }
   );
+
+  if (!Array.isArray(claimed) || claimed.length === 0) {
+    return {
+      success: false,
+      http_status: 409,
+      error:
+        "This niche was already claimed by another request. Retry.",
+      source,
+      niche: niche.niche_name
+    };
+  }
+
+  try {
+    const task = await generateSourceTask(
+      env,
+      application,
+      niche,
+      source
+    );
+
+    // task is saved as plain text.
+    const taskText = String(task).trim();
+
+    if (!taskText) {
+      throw new Error(
+        "Sarvam generated an empty task"
+      );
+    }
+
+    const plannerRun = {
+      application_id: applicationId,
+      user_id: application.user_id || null,
+      worker_type: SOURCE_WORKER_TYPE[source],
+      source: "system",
+      task: taskText,
+      pending_count: 1,
+      error: null,
+      niche: niche.niche_name,
+      created_at: new Date().toISOString(),
+      started_at: null
+    };
+
+    const inserted = await supabaseRequest(
+      env,
+      "/planner_runs",
+      {
+        method: "POST",
+        headers: {
+          "Prefer": "return=representation"
+        },
+        body: plannerRun
+      }
+    );
+
+    // Only mark queued after planner_runs insert succeeds.
+    const updated = await supabaseRequest(
+      env,
+      "/customer_niches?id=eq." +
+        encodeURIComponent(niche.id) +
+        "&application_id=eq." +
+        encodeURIComponent(applicationId) +
+        "&" + statusField + "=eq.processing",
+      {
+        method: "PATCH",
+        headers: {
+          "Prefer": "return=representation"
+        },
+        body: {
+          [statusField]: "queued",
+          updated_at: new Date().toISOString()
+        }
+      }
+    );
+
+    if (!Array.isArray(updated) || updated.length === 0) {
+      console.error(
+        "Task inserted but niche status did not update:",
+        niche.id,
+        source
+      );
+
+      return {
+        success: true,
+        warning:
+          "Task was saved, but the niche status update did not return a row.",
+        application_id: applicationId,
+        source,
+        niche: niche.niche_name,
+        task,
+        planner_run: Array.isArray(inserted)
+          ? inserted[0] || null
+          : inserted
+      };
+    }
+
+    return {
+      success: true,
+      message: "Task created successfully",
+      application_id: applicationId,
+      source,
+      niche: niche.niche_name,
+      buying_intention: niche.buying_intention,
+      status: "queued",
+      task,
+      planner_run: Array.isArray(inserted)
+        ? inserted[0] || null
+        : inserted
+    };
+  } catch (error) {
+    console.error(
+      "Task creation failed:",
+      source,
+      niche.niche_name,
+      error
+    );
+
+    // Return the niche to pending so the next request
+    // can retry after a temporary AI or database failure.
+    try {
+      await supabaseRequest(
+        env,
+        "/customer_niches?id=eq." +
+          encodeURIComponent(niche.id) +
+          "&application_id=eq." +
+          encodeURIComponent(applicationId) +
+          "&" + statusField + "=eq.processing",
+        {
+          method: "PATCH",
+          headers: {
+            "Prefer": "return=minimal"
+          },
+          body: {
+            [statusField]: "pending",
+            updated_at: new Date().toISOString()
+          }
+        }
+      );
+    } catch (resetError) {
+      console.error(
+        "Could not return niche to pending:",
+        resetError
+      );
+    }
+
+    throw error;
+  }
 }
 
+// ============================================================
+// GENERATE A REDDIT OR APOLLO TASK USING SARVAM
+// ============================================================
+
+async function generateSourceTask(
+  env,
+  application,
+  niche,
+  source
+) {
+  const companyInfo = {
+    name: application.name || "",
+    company: application.company || "",
+    domain: application.domain || "",
+    description:
+      application.description ||
+      application.company_description ||
+      "",
+    industry: application.industry || ""
+  };
+
+  const nicheInfo = {
+    niche_name: niche.niche_name,
+    buying_intention: niche.buying_intention
+  };
+
+  const systemPrompt = `
+You are Reportli AI's task planner.
+
+Create exactly one practical task for a downstream worker.
+Return valid JSON only, using this shape:
+{
+  "task": "Plain-text task instructions"
+}
+
+Rules:
+- The task value must be plain text, not a JSON object.
+- Do not claim any research has already been completed.
+- Do not invent facts about the company.
+- Focus only on the provided niche.
+- Make the task executable by a downstream worker.
+- Do not include markdown fences.
+`;
+
+  let sourceInstructions;
+
+  if (source === "reddit") {
+    sourceInstructions = `
+Create a Reddit research task.
+
+The task should tell the downstream worker to:
+- Research relevant public Reddit posts and discussions.
+- Look for recent, real customer problems related to this niche.
+- Prioritize posts showing buying intent, dissatisfaction, or requests for solutions.
+- Identify recurring pain points and the language customers use.
+- Avoid inventing posts, quotes, users, URLs, or engagement metrics.
+- Return source URLs for findings.
+- Target up to 20 relevant new posts where available.
+- Focus on posts from the last 7 days when possible.
+- Consider relevant communities such as SaaS, startups, Entrepreneur,
+  indiehackers, and sales, but do not restrict research to them if better
+  relevant communities exist.
+`;
+  } else {
+    sourceInstructions = `
+Create a B2B lead-generation task for an Apollo-connected worker.
+
+The task should tell the downstream worker to:
+- Identify companies and contacts relevant to this niche.
+- Define useful company and role filters.
+- Prioritize likely buyers and decision-makers.
+- Use the connected provider and its available credits.
+- Do not invent names, email addresses, company facts, or contact details.
+- Record source and verification information when available.
+- Do not send outreach unless another system explicitly authorizes it.
+`;
+  }
+
+  const userPrompt = `
+Company:
+${JSON.stringify(companyInfo, null, 2)}
+
+Selected niche:
+${JSON.stringify(nicheInfo, null, 2)}
+
+Source:
+${source}
+
+Task requirements:
+${sourceInstructions}
+
+Return one JSON object containing a single "task" string.
+`;
+
+  const result = await callSarvamJson(
+    env,
+    systemPrompt,
+    userPrompt,
+    1800
+  );
+
+  const task = String(result.task || "").trim();
+
+  if (!task) {
+    throw new Error(
+      "Sarvam did not return a task string"
+    );
+  }
+
+  return task;
+}
 
 // ============================================================
-// RESET ONE SOURCE CYCLE
+// RESET SOURCE CYCLE
 //
-// Only the selected source's statuses are reset.
-// The other source's statuses remain untouched.
+// When all active niches are completed for a source:
+// 1. Sort by their previous updated_at values.
+// 2. Reset that source's statuses to pending.
+// 3. Assign increasing timestamps in that order.
+// 4. The oldest niche therefore remains first in the new cycle.
+//
+// The other source's status is never modified.
 // ============================================================
 
 async function resetSourceCycle(
@@ -961,53 +1341,22 @@ async function resetSourceCycle(
   source,
   niches
 ) {
-  const statusField = source + "_status";
+  const statusField =
+    SOURCE_STATUS_FIELD[source];
 
-  for (const niche of niches) {
-    if (niche[statusField] !== "completed") {
-      throw new Error(
-        "Cannot reset cycle: not all niches are completed"
-      );
-    }
-  }
+  const activeNiches = niches
+    .filter(niche => niche.is_active !== false)
+    .sort((a, b) => {
+      const timeA = Date.parse(
+        a.updated_at || a.created_at || ""
+      ) || 0;
 
-  // Reset only niches belonging to this application.
-  // Set updated_at so the next cycle can choose the oldest.
-  const now = new Date().toISOString();
+      const timeB = Date.parse(
+        b.updated_at || b.created_at || ""
+      ) || 0;
 
-  for (const niche of niches) {
-    await supabaseRequest(
-      env,
-      "/rest/v1/customer_niches" +
-        "?id=eq." + encodeURIComponent(niche.id) +
-        "&application_id=eq." +
-        encodeURIComponent(applicationId) +
-        "&" + statusField + "=eq.completed",
-      {
-        method: "PATCH",
-        headers: {
-          "Prefer": "return=representation"
-        },
-        body: {
-          [statusField]: "pending",
-          updated_at: now
-        }
+      if (timeA !== timeB) {
+        return timeA - timeB;
       }
-    );
-  }
 
-  console.log(
-    "Reset source cycle:",
-    source,
-    applicationId
-  );
-}
-
-
-// ============================================================
-// CLAIM ONE NICHE
-//
-// Atomically changes pending -> processing.
-// Only one concurrent request can successfully claim the
-// same niche status using this conditional PATCH.
-// ============================================================
+      return
