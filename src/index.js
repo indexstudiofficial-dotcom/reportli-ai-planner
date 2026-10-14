@@ -1259,20 +1259,7 @@ Rules:
 
   if (source === "reddit") {
     sourceInstructions = `
-Create a Reddit research task.
-
-The task should tell the downstream worker to:
-- Research relevant public Reddit posts and discussions.
-- Look for recent, real customer problems related to this niche.
-- Prioritize posts showing buying intent, dissatisfaction, or requests for solutions.
-- Identify recurring pain points and the language customers use.
-- Avoid inventing posts, quotes, users, URLs, or engagement metrics.
-- Return source URLs for findings.
-- Target up to 20 relevant new posts where available.
-- Focus on posts from the last 7 days when possible.
-- Consider relevant communities such as SaaS, startups, Entrepreneur,
-  indiehackers, and sales, but do not restrict research to them if better
-  relevant communities exist.
+Research up to 20 recent Reddit posts (preferably from the last 7 days) about real customer problems in this niche. Prioritize buying intent, dissatisfaction, requests for solutions, recurring pain points, and customer language. Explore relevant communities, including SaaS, startups, Entrepreneur, indiehackers, and sales. Return source URLs and never invent posts, quotes, users, or engagement metrics.
 `;
   } else {
     sourceInstructions = `
