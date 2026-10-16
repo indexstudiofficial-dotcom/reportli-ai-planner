@@ -1,56 +1,54 @@
 /**
- * ============================================================
- * LEAD RESEARCH PLANNER — NICHE FINDER WORKER
- * Version: 6.0.0
- * ============================================================
+ * Reportli AI Planner Worker
+ * Version: 3.0.0
  *
- * PURPOSE
- * 1. Receive new applications from Supabase.
- * 2. Create the initial planner_runs task WITHOUT AI.
- * 3. Mark that initial task Completed immediately.
- * 4. Read company information from applications.
- * 5. Use Sarvam AI to discover exactly 10 customer niches.
- * 6. Normalize buying-intention scores to total exactly 100.
- * 7. Save the niches in customer_niches.
- * 8. Update applications.planner_status.
+ * Responsibilities:
+ * 1. Receive new application webhooks.
+ * 2. Create the initial planner_runs task.
+ * 3. Generate 10 customer niches with Sarvam AI.
+ * 4. Normalize buying-intention scores to exactly 100.
+ * 5. Save niches to customer_niches.
+ * 6. Update applications.planner_status.
+ * 7. Save processing errors in planner_runs.error.
  *
- * NO REDDIT TASK CREATION.
- * NO APOLLO TASK CREATION.
- * NO is_active COLUMN.
+ * Endpoints:
+ * GET  /health
+ * POST /webhook
+ * POST /test
  *
- * REQUIRED CLOUDFLARE SECRETS:
+ * Required Cloudflare secrets:
  * SUPABASE_URL
  * SUPABASE_SERVICE_ROLE_KEY
  * SARVAM_API_KEY
- * ============================================================
  */
 
-const VERSION = "6.0.0";
+const WORKER_NAME = "reportli-ai-planner";
+const WORKER_VERSION = "3.0.0";
+
+const PLANNER_WORKER_TYPE = "niche_finder";
+const PLANNER_SOURCE = "niche_finder";
+const PLANNER_TASK_TEXT =
+  "Analyze the company and find 10 customer niches";
 
 const SARVAM_URL =
   "https://api.sarvam.ai/v1/chat/completions";
 
 const SARVAM_MODEL = "sarvam-105b";
 
-const INITIAL_TASK =
-  "Analyze the company and find 10 customer niches";
-
-const NICHE_WORKER_TYPE = "niche_finder";
-const NICHE_SOURCE = "niche_finder";
-
-const REQUEST_TIMEOUT_MS = 25000;
+const MAX_ERROR_LENGTH = 8000;
+const MAX_BUSINESS_CONTEXT_LENGTH = 12000;
 
 // ============================================================
 // MAIN ROUTER
 // ============================================================
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers":
-        "Content-Type, Authorization, apikey, x-webhook-secret",
+        "Content-Type, Authorization, apikey",
     };
 
     if (request.method === "OPTIONS") {
@@ -64,46 +62,66 @@ export default {
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
     try {
-      validateEnvironment(env);
+      // ------------------------------------------------------
+      // Health check
+      // ------------------------------------------------------
 
       if (request.method === "GET" && path === "/health") {
         return jsonResponse(
           {
             success: true,
-            worker: "lead-research-planner",
-            version: VERSION,
-            purpose: "Customer niche discovery",
-            ai_provider: "Sarvam AI",
-            reddit_task_creation: false,
-            apollo_task_creation: false,
-            timestamp: new Date().toISOString(),
+            worker: WORKER_NAME,
+            version: WORKER_VERSION,
+            status: "healthy",
           },
           200,
           corsHeaders
         );
       }
 
+      // All processing endpoints require these secrets.
+      validateEnvironment(env);
+
+      // ------------------------------------------------------
+      // Supabase Database Webhook
+      // ------------------------------------------------------
+
       if (request.method === "POST" && path === "/webhook") {
-        const body = await request.json();
+        const payload = await readJsonBody(request);
 
         const applicationId =
-          body.application_id ||
-          body.record?.id ||
-          body.id;
+          payload?.record?.id ??
+          payload?.application?.id ??
+          payload?.application_id;
 
         if (!applicationId) {
           return jsonResponse(
             {
               success: false,
-              error: "Missing application_id",
+              error:
+                "Missing application ID. Expected record.id in the webhook payload.",
             },
             400,
             corsHeaders
           );
         }
 
-        // Accept Supabase Database Webhook payloads and
-        // direct POST requests containing application_id.
+        // Ignore events that are explicitly not INSERT events.
+        if (
+          payload?.type &&
+          String(payload.type).toUpperCase() !== "INSERT"
+        ) {
+          return jsonResponse(
+            {
+              success: true,
+              skipped: true,
+              reason: "Event is not an INSERT event.",
+            },
+            200,
+            corsHeaders
+          );
+        }
+
         const result = await processApplication(
           String(applicationId),
           env
@@ -112,14 +130,18 @@ export default {
         return jsonResponse(result, 200, corsHeaders);
       }
 
-      if (request.method === "POST" && path === "/test") {
-        const body = await request.json();
+      // ------------------------------------------------------
+      // Manual test endpoint
+      // ------------------------------------------------------
 
-        if (!body.application_id) {
+      if (request.method === "POST" && path === "/test") {
+        const payload = await readJsonBody(request);
+
+        if (!payload?.application_id) {
           return jsonResponse(
             {
               success: false,
-              error: "Provide application_id",
+              error: "application_id is required.",
             },
             400,
             corsHeaders
@@ -127,18 +149,22 @@ export default {
         }
 
         const result = await processApplication(
-          String(body.application_id),
+          String(payload.application_id),
           env
         );
 
         return jsonResponse(result, 200, corsHeaders);
       }
 
+      // ------------------------------------------------------
+      // Unknown endpoint
+      // ------------------------------------------------------
+
       return jsonResponse(
         {
           success: false,
-          error: "Route not found",
-          available_routes: [
+          error: "Endpoint not found.",
+          available_endpoints: [
             "GET /health",
             "POST /webhook",
             "POST /test",
@@ -148,13 +174,15 @@ export default {
         corsHeaders
       );
     } catch (error) {
-      console.error("Worker request failed:", error.message);
+      const errorMessage = getErrorMessage(error);
+
+      console.error("Worker request failed:", errorMessage);
 
       return jsonResponse(
         {
           success: false,
-          error: error.message || "Internal server error",
-          version: VERSION,
+          worker: WORKER_NAME,
+          error: errorMessage,
         },
         500,
         corsHeaders
@@ -168,14 +196,14 @@ export default {
 // ============================================================
 
 function validateEnvironment(env) {
-  const required = [
+  const requiredSecrets = [
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
     "SARVAM_API_KEY",
   ];
 
-  const missing = required.filter(
-    (key) => !env[key] || !String(env[key]).trim()
+  const missing = requiredSecrets.filter(
+    (key) => !env[key]
   );
 
   if (missing.length > 0) {
@@ -186,7 +214,7 @@ function validateEnvironment(env) {
 }
 
 // ============================================================
-// JSON RESPONSE
+// HTTP RESPONSE HELPERS
 // ============================================================
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
@@ -199,109 +227,102 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
   });
 }
 
+async function readJsonBody(request) {
+  try {
+    return await request.json();
+  } catch {
+    throw new Error("Request body must contain valid JSON.");
+  }
+}
+
+function getErrorMessage(error) {
+  let message;
+
+  if (error instanceof Error) {
+    message = error.message;
+  } else if (typeof error === "string") {
+    message = error;
+  } else {
+    try {
+      message = JSON.stringify(error);
+    } catch {
+      message = String(error);
+    }
+  }
+
+  return String(message || "Unknown error").slice(
+    0,
+    MAX_ERROR_LENGTH
+  );
+}
+
 // ============================================================
 // SUPABASE REST HELPER
 // ============================================================
 
 async function supabaseRequest(
   env,
-  table,
+  path,
   options = {}
 ) {
-  const {
-    method = "GET",
-    query = "",
-    body = undefined,
-    prefer = undefined,
-  } = options;
-
   const baseUrl = env.SUPABASE_URL.replace(/\/+$/, "");
 
-  const url =
-    `${baseUrl}/rest/v1/${table}` +
-    (query ? `?${query}` : "");
-
-  const headers = {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    Accept: "application/json",
-  };
-
-  if (body !== undefined) {
-    headers["Content-Type"] = "application/json";
-  }
-
-  if (prefer) {
-    headers.Prefer = prefer;
-  }
-
-  const controller = new AbortController();
-
-  const timeout = setTimeout(
-    () => controller.abort(),
-    REQUEST_TIMEOUT_MS
+  const response = await fetch(
+    `${baseUrl}/rest/v1/${path}`,
+    {
+      ...options,
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization:
+          `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+    }
   );
 
-  try {
-    const response = await fetch(url, {
-      method,
-      headers,
-      body:
-        body === undefined
-          ? undefined
-          : JSON.stringify(body),
-      signal: controller.signal,
-    });
+  const responseText = await response.text();
 
-    const text = await response.text();
+  let responseData = null;
 
-    let data = null;
-
-    if (text) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = { raw_response: text };
-      }
+  if (responseText) {
+    try {
+      responseData = JSON.parse(responseText);
+    } catch {
+      responseData = responseText;
     }
-
-    if (!response.ok) {
-      throw new Error(
-        `Supabase ${method} ${table} failed ` +
-        `(${response.status}): ${JSON.stringify(data)}`
-      );
-    }
-
-    return data;
-  } catch (error) {
-    if (error.name === "AbortError") {
-      throw new Error(
-        `Supabase request timed out: ${table}`
-      );
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timeout);
   }
+
+  if (!response.ok) {
+    const details =
+      typeof responseData === "string"
+        ? responseData
+        : JSON.stringify(responseData);
+
+    throw new Error(
+      `Supabase ${options.method || "GET"} ${path} failed ` +
+      `(${response.status}): ${details}`
+    );
+  }
+
+  return responseData;
 }
 
 // ============================================================
-// FETCH APPLICATION
-// Uses your actual applications table.
+// APPLICATION HELPERS
 // ============================================================
 
 async function getApplication(applicationId, env) {
   const query = new URLSearchParams({
-    select: "id,name,api_key,user_id,domain,company,planner_status",
+    select:
+      "id,name,company,domain,user_id,planner_status",
     id: `eq.${applicationId}`,
     limit: "1",
-  }).toString();
+  });
 
   const rows = await supabaseRequest(
     env,
-    "applications",
-    { query }
+    `applications?${query.toString()}`
   );
 
   if (!Array.isArray(rows) || rows.length === 0) {
@@ -313,736 +334,813 @@ async function getApplication(applicationId, env) {
   return rows[0];
 }
 
-// ============================================================
-// UPDATE APPLICATION STATUS
-// ============================================================
-
-async function updateApplicationStatus(
+async function updateApplicationPlannerStatus(
   applicationId,
   status,
   env
 ) {
   const query = new URLSearchParams({
     id: `eq.${applicationId}`,
-  }).toString();
+  });
 
-  return supabaseRequest(
+  await supabaseRequest(
     env,
-    "applications",
+    `applications?${query.toString()}`,
     {
       method: "PATCH",
-      query,
-      body: {
-        planner_status: status,
+      headers: {
+        Prefer: "return=minimal",
       },
-      prefer: "return=minimal",
+      body: JSON.stringify({
+        planner_status: status,
+      }),
     }
   );
 }
 
 // ============================================================
-// STEP 1: CREATE INITIAL PLANNER TASK WITHOUT AI
-//
-// This task is marked Completed immediately.
-// Sarvam AI is NOT called by this function.
-//
-// Uses your supplied planner_runs schema.
+// PLANNER TASK HELPERS
 // ============================================================
 
-async function createInitialPlannerTask(
-  application,
-  env
-) {
-  // Check whether a previous webhook already created it.
-  // This helps prevent duplicate tasks when Supabase retries.
+async function findPlannerTask(applicationId, env) {
   const query = new URLSearchParams({
-    select: "id,status,task,created_at",
-    application_id: `eq.${application.id}`,
-    worker_type: `eq.${NICHE_WORKER_TYPE}`,
-    source: `eq.${NICHE_SOURCE}`,
-    task: `eq.${INITIAL_TASK}`,
+    select: "id,application_id,status,error,created_at",
+    application_id: `eq.${applicationId}`,
+    worker_type: `eq.${PLANNER_WORKER_TYPE}`,
+    source: `eq.${PLANNER_SOURCE}`,
+    task: `eq.${PLANNER_TASK_TEXT}`,
     order: "created_at.desc",
     limit: "1",
-  }).toString();
+  });
 
-  const existing = await supabaseRequest(
+  const rows = await supabaseRequest(
     env,
-    "planner_runs",
-    { query }
+    `planner_runs?${query.toString()}`
   );
 
-  if (Array.isArray(existing) && existing.length > 0) {
-    console.log(
-      "Initial planner task already exists:",
-      existing[0].id
-    );
+  return Array.isArray(rows) && rows.length > 0
+    ? rows[0]
+    : null;
+}
 
-    return existing[0];
-  }
-
-  const payload = {
-    application_id: application.id,
-    user_id: application.user_id ?? null,
-    worker_type: NICHE_WORKER_TYPE,
-    source: NICHE_SOURCE,
-    task: INITIAL_TASK,
-    pending_count: 0,
-    error: null,
-    niche: null,
-    status: "Completed",
-  };
-
+async function createPlannerTask(application, env) {
   const rows = await supabaseRequest(
     env,
     "planner_runs",
     {
       method: "POST",
-      query: "",
-      body: payload,
-      prefer: "return=representation",
+      headers: {
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify([
+        {
+          application_id: application.id,
+          user_id: application.user_id || null,
+          worker_type: PLANNER_WORKER_TYPE,
+          source: PLANNER_SOURCE,
+          task: PLANNER_TASK_TEXT,
+          pending_count: 0,
+          error: null,
+          niche: null,
+
+          // The initial planner task is marked Completed
+          // immediately, as requested.
+          status: "Completed",
+
+          started_at: new Date().toISOString(),
+        },
+      ]),
     }
   );
 
-  if (!Array.isArray(rows) || rows.length === 0) {
+  if (!Array.isArray(rows) || !rows[0]?.id) {
     throw new Error(
-      "Initial planner task was not returned by Supabase"
+      "Planner task was not created or Supabase did not return its ID."
     );
   }
-
-  console.log(
-    "Initial planner task created and completed:",
-    rows[0].id
-  );
 
   return rows[0];
 }
 
-// ============================================================
-// STEP 2: OPTIONAL COMPANY CONTEXT
-//
-// Reads business_data if available.
-// Missing optional context will not stop niche discovery.
-// ============================================================
+async function ensurePlannerTask(application, env) {
+  const existing = await findPlannerTask(
+    application.id,
+    env
+  );
 
-async function getBusinessData(applicationId, env) {
-  try {
-    const query = new URLSearchParams({
-      select: "field,data,source_url",
-      application_id: `eq.${applicationId}`,
-      limit: "30",
-    }).toString();
-
-    const rows = await supabaseRequest(
-      env,
-      "business_data",
-      { query }
+  if (existing) {
+    // Clear a previous error when a new attempt begins.
+    // Keep the task's status unchanged.
+    await updatePlannerTaskError(
+      existing.id,
+      null,
+      env
     );
 
-    return Array.isArray(rows) ? rows : [];
-  } catch (error) {
-    console.warn(
-      "Optional business_data unavailable:",
-      error.message
-    );
-
-    return [];
+    return existing;
   }
+
+  return await createPlannerTask(application, env);
 }
 
 // ============================================================
-// BUILD COMPANY SUMMARY
+// IMPORTANT: SAVE ACTUAL ERRORS IN planner_runs.error
 // ============================================================
 
-function buildCompanySummary(application, businessData) {
-  const parts = [];
-
-  if (application.name) {
-    parts.push(`Application name: ${application.name}`);
-  }
-
-  if (application.company) {
-    parts.push(`Company information: ${application.company}`);
-  }
-
-  if (application.domain) {
-    parts.push(`Website/domain: ${application.domain}`);
-  }
-
-  if (Array.isArray(businessData) && businessData.length > 0) {
-    const context = businessData
-      .map((row) => {
-        let value = row.data;
-
-        if (typeof value !== "string") {
-          value = JSON.stringify(value);
-        }
-
-        return (
-          `Field: ${row.field}\n` +
-          `Source: ${row.source_url || "Not provided"}\n` +
-          `Data: ${(value || "").slice(0, 4000)}`
-        );
-      })
-      .join("\n\n");
-
-    parts.push(
-      `Additional company information:\n${context.slice(0, 18000)}`
-    );
-  }
-
-  const summary = parts.join("\n\n").trim();
-
-  if (!summary) {
-    throw new Error(
-      "The application has no usable company information. " +
-      "Provide company, name, or domain."
-    );
-  }
-
-  return summary;
-}
-
-// ============================================================
-// STEP 3: CALL SARVAM AI
-//
-// Sarvam generates niches only.
-// It does not create planner_runs tasks.
-// ============================================================
-
-async function callSarvamForNiches(
-  companySummary,
+async function updatePlannerTaskError(
+  plannerTaskId,
+  error,
   env
 ) {
-  const systemPrompt = `
-You are a B2B market research strategist.
+  if (!plannerTaskId) {
+    throw new Error(
+      "Cannot update planner error because planner task ID is missing."
+    );
+  }
 
-Your job is to identify the 10 most promising BROAD CUSTOMER
-SEGMENTS for a company.
+  const query = new URLSearchParams({
+    id: `eq.${plannerTaskId}`,
+  });
 
-Use the company's actual information to decide which segments
-are relevant.
+  const errorMessage =
+    error === null || error === undefined
+      ? null
+      : getErrorMessage(error);
 
-CUSTOMER SEGMENT RULES:
-- Return exactly 10 distinct customer segments.
-- Prefer broad audience types, industries, business models,
-  or professional groups.
-- Examples of segment types include SaaS founders, freelancers,
-  agencies, Shopify store owners, consultants, small businesses,
-  e-commerce businesses, app developers, and marketing agencies.
-- These are examples only. Do not blindly use irrelevant examples.
-- Avoid overly specific product categories or long descriptive
-  combinations unless the company genuinely serves that market.
-- Each niche must represent a meaningfully different audience.
-- Do not invent company features, products, or services.
-- Do not include generic audiences that have no plausible need
-  for the company's product or service.
-- Rank niches from highest to lowest purchase intent.
-- buying_intention must be a positive integer score.
-- Scores do not need to total 100; the worker will normalize them.
-- Do not include explanations outside the JSON.
-- Return valid JSON only.
+  await supabaseRequest(
+    env,
+    `planner_runs?${query.toString()}`,
+    {
+      method: "PATCH",
+      headers: {
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        error: errorMessage,
+      }),
+    }
+  );
 
-Required JSON structure:
+  if (errorMessage) {
+    console.error(
+      "Saved error to planner_runs.error:",
+      {
+        plannerTaskId,
+        error: errorMessage,
+      }
+    );
+  }
+}
+
+// ============================================================
+// OPTIONAL BUSINESS CONTEXT
+// ============================================================
+
+async function getBusinessData(
+  applicationId,
+  env
+) {
+  const query = new URLSearchParams({
+    select: "field,data",
+    application_id: `eq.${applicationId}`,
+    limit: "30",
+  });
+
+  try {
+    const rows = await supabaseRequest(
+      env,
+      `business_data?${query.toString()}`
+    );
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return "";
+    }
+
+    const context = rows
+      .map((row) => {
+        let value;
+
+        try {
+          value =
+            typeof row.data === "string"
+              ? row.data
+              : JSON.stringify(row.data);
+        } catch {
+          value = String(row.data);
+        }
+
+        return `${row.field || "business_information"}: ${value}`;
+      })
+      .join("\n");
+
+    return context.slice(
+      0,
+      MAX_BUSINESS_CONTEXT_LENGTH
+    );
+  } catch (error) {
+    // business_data is optional. A missing or inaccessible
+    // optional table must not prevent niche discovery.
+    console.warn(
+      "Optional business_data context unavailable:",
+      getErrorMessage(error)
+    );
+
+    return "";
+  }
+}
+
+// ============================================================
+// SARVAM AI: GENERATE CUSTOMER NICHES
+// ============================================================
+
+function buildNichePrompt(application, businessContext) {
+  const companyName =
+    application.company ||
+    application.name ||
+    "Unknown company";
+
+  const domain = application.domain || "Not provided";
+
+  return `
+You are a B2B customer-market research expert.
+
+Analyze this company and identify exactly 10 distinct,
+relevant customer niches that the company could target.
+
+COMPANY INFORMATION
+Company name: ${companyName}
+Application name: ${application.name || "Not provided"}
+Domain: ${domain}
+
+ADDITIONAL BUSINESS INFORMATION
+${businessContext || "No additional business information provided."}
+
+REQUIREMENTS
+1. Return exactly 10 customer niches.
+2. Make each niche relevant to the company's product,
+   service, industry, and likely customers.
+3. Prefer useful, actionable market segments.
+4. Avoid repeating the same niche with slightly different wording.
+5. Do not invent company facts.
+6. Give each niche a positive numeric buying-intention weight.
+7. The weights do not need to total 100; the application
+   will normalize them.
+8. Return valid JSON only. Do not include Markdown fences.
+
+REQUIRED JSON FORMAT
 {
   "niches": [
     {
-      "niche_name": "SaaS founders",
-      "buying_intention": 20
+      "niche_name": "A specific customer segment",
+      "buying_intention": 10
     }
   ]
 }
+`.trim();
+}
 
-The niches array must contain exactly 10 objects.
-`;
-
-  const userPrompt = `
-Analyze this company and find 10 customer niches.
-
-COMPANY INFORMATION:
-${companySummary}
-
-Choose the segments most likely to need and pay for this
-company's actual product or service.
-`;
-
-  const controller = new AbortController();
-
-  const timeout = setTimeout(
-    () => controller.abort(),
-    REQUEST_TIMEOUT_MS
+async function generateNiches(
+  application,
+  businessContext,
+  env
+) {
+  const prompt = buildNichePrompt(
+    application,
+    businessContext
   );
 
-  try {
-    const response = await fetch(SARVAM_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "api-subscription-key": env.SARVAM_API_KEY,
+  const response = await fetch(SARVAM_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-subscription-key": env.SARVAM_API_KEY,
+    },
+    body: JSON.stringify({
+      model: SARVAM_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You generate accurate, relevant customer niches and return valid JSON only.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      temperature: 0.2,
+      max_tokens: 4096,
+      response_format: {
+        type: "json_object",
       },
-      body: JSON.stringify({
-        model: SARVAM_MODEL,
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt,
-          },
-          {
-            role: "user",
-            content: userPrompt,
-          },
-        ],
-        temperature: 0.2,
-        max_tokens: 4096,
-      }),
-      signal: controller.signal,
-    });
+    }),
+  });
 
-    const responseText = await response.text();
+  const responseText = await response.text();
 
-    let responseData;
+  if (!response.ok) {
+    throw new Error(
+      `Sarvam API failed with status ${response.status}: ` +
+      responseText.slice(0, 3000)
+    );
+  }
+
+  let responseData;
+
+  try {
+    responseData = JSON.parse(responseText);
+  } catch {
+    throw new Error(
+      "Sarvam returned an invalid API response: " +
+      responseText.slice(0, 2000)
+    );
+  }
+
+  const content =
+    responseData?.choices?.[0]?.message?.content;
+
+  if (!content) {
+    throw new Error(
+      "Sarvam returned no message content."
+    );
+  }
+
+  let parsed;
+
+  if (typeof content === "string") {
+    let cleanContent = content.trim();
+
+    // Remove optional Markdown JSON fences.
+    cleanContent = cleanContent
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/, "")
+      .trim();
 
     try {
-      responseData = JSON.parse(responseText);
+      parsed = JSON.parse(cleanContent);
     } catch {
       throw new Error(
-        `Sarvam returned invalid JSON response: ` +
-        responseText.slice(0, 1000)
+        "Could not parse Sarvam's niche JSON: " +
+        cleanContent.slice(0, 2000)
       );
     }
-
-    if (!response.ok) {
-      throw new Error(
-        `Sarvam API error (${response.status}): ` +
-        JSON.stringify(responseData).slice(0, 1500)
-      );
-    }
-
-    const content =
-      responseData?.choices?.[0]?.message?.content;
-
-    if (!content) {
-      throw new Error(
-        "Sarvam returned no message content: " +
-        JSON.stringify(responseData).slice(0, 1500)
-      );
-    }
-
-    return parseModelJson(content);
-  } catch (error) {
-    if (error.name === "AbortError") {
-      throw new Error("Sarvam AI request timed out");
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-// ============================================================
-// PARSE SARVAM JSON
-// Supports JSON code fences and surrounding text.
-// ============================================================
-
-function parseModelJson(content) {
-  if (typeof content !== "string") {
-    if (content && typeof content === "object") {
-      return content;
-    }
-
+  } else if (typeof content === "object") {
+    parsed = content;
+  } else {
     throw new Error(
-      "Sarvam returned an unsupported content format"
+      "Sarvam returned an unsupported message format."
     );
   }
 
-  let cleaned = content.trim();
-
-  cleaned = cleaned
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/, "")
-    .trim();
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
-
-    if (start !== -1 && end > start) {
-      try {
-        return JSON.parse(
-          cleaned.slice(start, end + 1)
-        );
-      } catch {
-        // Throw the standard error below.
-      }
-    }
-
-    throw new Error(
-      "Sarvam's niche output was not valid JSON: " +
-      cleaned.slice(0, 1000)
-    );
-  }
-}
-
-// ============================================================
-// STEP 4: VALIDATE AND NORMALIZE SCORES
-//
-// Guarantees:
-// - Exactly 10 unique niches.
-// - Each score is a positive integer.
-// - All scores add up to exactly 100.
-// - Higher model scores retain higher relative priority.
-// ============================================================
-
-function normalizeNiches(modelOutput) {
-  const rawNiches = Array.isArray(modelOutput)
-    ? modelOutput
-    : modelOutput?.niches;
+  const rawNiches = Array.isArray(parsed)
+    ? parsed
+    : parsed.niches;
 
   if (!Array.isArray(rawNiches)) {
     throw new Error(
-      "Sarvam output must contain a niches array"
+      "Sarvam response does not contain a niches array."
     );
   }
 
-  const unique = [];
-  const seen = new Set();
+  // Clean names and remove duplicate names.
+  const uniqueNiches = [];
+  const seenNames = new Set();
 
   for (const item of rawNiches) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
     const name = String(
-      item.niche_name ||
-      item.niche ||
-      item.name ||
+      item?.niche_name ||
+      item?.name ||
+      item?.niche ||
       ""
-    )
-      .trim()
-      .replace(/\s+/g, " ");
+    ).trim();
 
     if (!name) {
       continue;
     }
 
-    const key = name.toLowerCase();
+    const normalizedName = name.toLowerCase();
 
-    if (seen.has(key)) {
+    if (seenNames.has(normalizedName)) {
       continue;
     }
 
-    seen.add(key);
+    seenNames.add(normalizedName);
 
-    let score = Number(item.buying_intention);
+    const score = Number(
+      item?.buying_intention ??
+      item?.score ??
+      1
+    );
 
-    if (!Number.isFinite(score) || score <= 0) {
-      score = 1;
-    }
-
-    score = Math.min(score, 10000);
-
-    unique.push({
+    uniqueNiches.push({
       niche_name: name,
-      original_score: score,
+      buying_intention:
+        Number.isFinite(score) && score > 0
+          ? score
+          : 1,
     });
-
-    if (unique.length === 10) {
-      break;
-    }
   }
 
-  if (unique.length !== 10) {
+  if (uniqueNiches.length !== 10) {
     throw new Error(
-      `Sarvam returned only ${unique.length} unique niches. ` +
-      "Exactly 10 unique niches are required. " +
-      "Retry the request."
+      `Sarvam returned ${uniqueNiches.length} unique valid niches; exactly 10 are required.`
     );
   }
 
-  // Sort by model-provided buying intention.
-  unique.sort(
-    (a, b) => b.original_score - a.original_score
-  );
+  return normalizeBuyingIntent(uniqueNiches);
+}
 
-  // Give every niche at least 1 point.
-  // Distribute the remaining 90 points proportionally.
-  const remainingPoints = 90;
+// ============================================================
+// NORMALIZE BUYING INTENTION TO EXACTLY 100
+// ============================================================
 
-  const totalWeight = unique.reduce(
-    (sum, item) => sum + item.original_score,
+function normalizeBuyingIntent(niches) {
+  if (!Array.isArray(niches) || niches.length !== 10) {
+    throw new Error(
+      "Buying-intention normalization requires exactly 10 niches."
+    );
+  }
+
+  const weights = niches.map((niche) => {
+    const score = Number(niche.buying_intention);
+
+    return Number.isFinite(score) && score > 0
+      ? score
+      : 1;
+  });
+
+  const totalWeight = weights.reduce(
+    (sum, score) => sum + score,
     0
   );
 
-  const allocations = unique.map((item, index) => {
+  if (!Number.isFinite(totalWeight) || totalWeight <= 0) {
+    throw new Error(
+      "Buying-intention weights are invalid."
+    );
+  }
+
+  // Reserve one point for each niche, guaranteeing positive
+  // integer scores. Distribute the remaining 90 points
+  // proportionally using the largest-remainder method.
+  const distributablePoints = 90;
+
+  const allocations = weights.map((weight, index) => {
     const exact =
-      (item.original_score / totalWeight) *
-      remainingPoints;
+      (weight / totalWeight) * distributablePoints;
 
     const floor = Math.floor(exact);
 
     return {
       index,
-      score: floor + 1,
+      floor,
       remainder: exact - floor,
     };
   });
 
   let allocated = allocations.reduce(
-    (sum, item) => sum + item.score,
+    (sum, item) => sum + item.floor,
     0
   );
 
-  let remaining = 100 - allocated;
-
-  const remainderOrder = [...allocations].sort(
+  allocations.sort(
     (a, b) => b.remainder - a.remainder
   );
 
-  let pointer = 0;
+  let index = 0;
 
-  while (remaining > 0) {
-    const target = remainderOrder[
-      pointer % remainderOrder.length
-    ];
-
-    allocations[target.index].score += 1;
-
-    remaining -= 1;
-    pointer += 1;
+  while (allocated < distributablePoints) {
+    allocations[index].floor += 1;
+    allocated += 1;
+    index += 1;
   }
 
-  const result = unique.map((item, index) => ({
-    niche_name: item.niche_name,
-    buying_intention: allocations[index].score,
+  const normalizedScores = new Array(10);
+
+  for (const allocation of allocations) {
+    normalizedScores[allocation.index] =
+      allocation.floor + 1;
+  }
+
+  const normalized = niches.map((niche, i) => ({
+    niche_name: niche.niche_name,
+    buying_intention: normalizedScores[i],
   }));
 
-  const finalTotal = result.reduce(
-    (sum, item) => sum + item.buying_intention,
+  const finalTotal = normalized.reduce(
+    (sum, niche) => sum + niche.buying_intention,
     0
   );
 
   if (
-    result.length !== 10 ||
-    finalTotal !== 100
+    finalTotal !== 100 ||
+    normalized.some(
+      (niche) => niche.buying_intention < 1
+    )
   ) {
     throw new Error(
-      `Niche score validation failed. ` +
-      `Count: ${result.length}; total: ${finalTotal}`
+      "Buying-intention normalization failed validation."
     );
   }
 
-  return result;
+  return normalized;
 }
 
 // ============================================================
-// STEP 5: READ EXISTING NICHES
-// Uses the actual customer_niches schema.
+// CUSTOMER NICHE DATABASE HELPERS
 // ============================================================
 
-async function getExistingNiches(applicationId, env) {
+async function getExistingNiches(
+  applicationId,
+  env
+) {
   const query = new URLSearchParams({
-    select: "id,niche_name,buying_intention,reddit_status,apollo_status",
+    select:
+      "id,application_id,niche_name,buying_intention,reddit_status,created_at,updated_at,user_id,apollo_status",
     application_id: `eq.${applicationId}`,
     order: "buying_intention.desc",
-  }).toString();
+  });
 
   const rows = await supabaseRequest(
     env,
-    "customer_niches",
-    { query }
+    `customer_niches?${query.toString()}`
   );
 
   return Array.isArray(rows) ? rows : [];
 }
 
-// ============================================================
-// STEP 6: SAVE NICHES
-//
-// No is_active column is used.
-// ============================================================
+async function deleteExistingNiches(
+  applicationId,
+  env
+) {
+  const query = new URLSearchParams({
+    application_id: `eq.${applicationId}`,
+  });
+
+  await supabaseRequest(
+    env,
+    `customer_niches?${query.toString()}`,
+    {
+      method: "DELETE",
+      headers: {
+        Prefer: "return=minimal",
+      },
+    }
+  );
+}
 
 async function saveNiches(
   application,
   niches,
   env
 ) {
-  const payload = niches.map((niche) => ({
+  if (niches.length !== 10) {
+    throw new Error(
+      `Refusing to save ${niches.length} niches; exactly 10 are required.`
+    );
+  }
+
+  const rows = niches.map((niche) => ({
     application_id: application.id,
-    user_id: application.user_id ?? null,
+    user_id: application.user_id || null,
     niche_name: niche.niche_name,
     buying_intention: niche.buying_intention,
     reddit_status: "pending",
     apollo_status: "pending",
   }));
 
-  const rows = await supabaseRequest(
+  const savedRows = await supabaseRequest(
     env,
     "customer_niches",
     {
       method: "POST",
-      body: payload,
-      prefer: "return=representation",
+      headers: {
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify(rows),
     }
   );
 
-  if (!Array.isArray(rows) || rows.length !== 10) {
+  if (!Array.isArray(savedRows) || savedRows.length !== 10) {
     throw new Error(
-      "Supabase did not confirm saving all 10 niches"
+      `Expected 10 saved customer niches but received ${
+        Array.isArray(savedRows) ? savedRows.length : 0
+      }.`
     );
   }
 
-  console.log(
-    `Saved ${rows.length} niches for application ${application.id}`
+  const total = savedRows.reduce(
+    (sum, niche) =>
+      sum + Number(niche.buying_intention || 0),
+    0
   );
 
-  return rows;
+  if (total !== 100) {
+    throw new Error(
+      `Saved buying-intention total is ${total}, not 100.`
+    );
+  }
+
+  return savedRows;
 }
 
 // ============================================================
-// STEP 7: PROCESS APPLICATION
-//
-// Workflow:
-// A. Fetch application.
-// B. Create initial task without AI.
-// C. Mark that task Completed immediately.
-// D. Check whether niches already exist.
-// E. Read company information.
-// F. Generate niches with Sarvam.
-// G. Normalize scores.
-// H. Save niches.
-// I. Update application status.
+// MAIN NICHE DISCOVERY FLOW
 // ============================================================
 
 async function processApplication(
   applicationId,
   env
 ) {
-  console.log(
-    "Starting niche discovery for application:",
-    applicationId
-  );
+  let plannerTaskId = null;
 
-  const application = await getApplication(
-    applicationId,
-    env
-  );
+  try {
+    console.log(
+      "Starting niche discovery for application:",
+      applicationId
+    );
 
-  // FIRST TASK: created and marked Completed WITHOUT AI.
-  const initialTask = await createInitialPlannerTask(
-    application,
-    env
-  );
-
-  // The initial task stays Completed even if AI fails.
-  // Its status represents completion of task creation,
-  // not completion of niche generation.
-
-  // If niches already exist, avoid duplicate insertion.
-  const existingNiches = await getExistingNiches(
-    application.id,
-    env
-  );
-
-  if (existingNiches.length >= 10) {
-    await updateApplicationStatus(
-      application.id,
-      "completed",
+    // 1. Load the application.
+    const application = await getApplication(
+      applicationId,
       env
     );
 
-    return {
-      success: true,
-      message: "Niches already exist; no duplicates inserted",
-      application_id: application.id,
-      planner_task_id: initialTask.id,
-      planner_task_status: initialTask.status,
-      niche_count: existingNiches.length,
-      niches: existingNiches,
-    };
-  }
+    // 2. Create or reuse the initial planner task.
+    // Its status is Completed immediately, as requested.
+    const plannerTask = await ensurePlannerTask(
+      application,
+      env
+    );
 
-  try {
-    await updateApplicationStatus(
+    plannerTaskId = plannerTask.id;
+
+    // 3. Mark the application as processing.
+    await updateApplicationPlannerStatus(
       application.id,
       "processing",
       env
     );
 
-    // Read optional website/business data.
-    const businessData = await getBusinessData(
+    // 4. Check whether all 10 niches already exist.
+    const existingNiches = await getExistingNiches(
       application.id,
       env
     );
 
-    const companySummary = buildCompanySummary(
-      application,
-      businessData
-    );
+    if (existingNiches.length === 10) {
+      const existingTotal = existingNiches.reduce(
+        (sum, niche) =>
+          sum + Number(niche.buying_intention || 0),
+        0
+      );
 
-    // Sarvam is called only after the initial task exists.
-    const modelOutput = await callSarvamForNiches(
-      companySummary,
+      if (existingTotal !== 100) {
+        throw new Error(
+          `Existing niches total ${existingTotal}; expected 100.`
+        );
+      }
+
+      await updateApplicationPlannerStatus(
+        application.id,
+        "completed",
+        env
+      );
+
+      return {
+        success: true,
+        message:
+          "Customer niches already exist; no duplicate niches were created.",
+        application_id: application.id,
+        planner_task_id: plannerTaskId,
+        planner_task_status: plannerTask.status,
+        niche_count: 10,
+        buying_intention_total: 100,
+        niches: existingNiches,
+      };
+    }
+
+    // 5. Get optional scraped business information.
+    const businessContext = await getBusinessData(
+      application.id,
       env
     );
 
-    const niches = normalizeNiches(modelOutput);
+    // 6. Generate exactly 10 unique niches with Sarvam.
+    const generatedNiches = await generateNiches(
+      application,
+      businessContext,
+      env
+    );
 
+    // 7. If an incomplete set exists, replace it with a
+    // complete set so the application ends with 10 niches.
+    if (existingNiches.length > 0) {
+      console.warn(
+        `Found ${existingNiches.length} existing niches. Replacing the incomplete set.`
+      );
+
+      await deleteExistingNiches(
+        application.id,
+        env
+      );
+    }
+
+    // 8. Save all 10 niches.
     const savedNiches = await saveNiches(
       application,
-      niches,
+      generatedNiches,
       env
     );
 
-    await updateApplicationStatus(
+    // 9. Mark the application as completed.
+    await updateApplicationPlannerStatus(
       application.id,
       "completed",
       env
     );
 
+    // 10. Clear any previous error after successful completion.
+    await updatePlannerTaskError(
+      plannerTaskId,
+      null,
+      env
+    );
+
     console.log(
-      `Niche discovery completed for ${application.id}`
+      "Niche discovery completed:",
+      {
+        applicationId: application.id,
+        plannerTaskId,
+        nicheCount: savedNiches.length,
+        buyingIntentionTotal: 100,
+      }
     );
 
     return {
       success: true,
       message: "Customer niche discovery completed",
       application_id: application.id,
-      planner_task_id: initialTask.id,
-      planner_task_status: "Completed",
+      planner_task_id: plannerTaskId,
+      planner_task_status: plannerTask.status,
       niche_count: savedNiches.length,
-      buying_intention_total: savedNiches.reduce(
-        (sum, item) => sum + item.buying_intention,
-        0
-      ),
+      buying_intention_total: 100,
       niches: savedNiches,
     };
   } catch (error) {
+    const errorMessage = getErrorMessage(error);
+
     console.error(
-      "Niche discovery failed:",
-      error.message
+      "Customer niche discovery failed:",
+      {
+        applicationId,
+        plannerTaskId,
+        error: errorMessage,
+      }
     );
 
-    // The initial planner task remains Completed.
-    // Record the AI processing failure on the application.
+    // IMPORTANT:
+    // Save the actual failure in planner_runs.error.
+    // Do not replace the original error if this update fails.
+    if (plannerTaskId) {
+      try {
+        await updatePlannerTaskError(
+          plannerTaskId,
+          errorMessage,
+          env
+        );
+      } catch (saveError) {
+        console.error(
+          "CRITICAL: Could not save the error in planner_runs.error:",
+          {
+            plannerTaskId,
+            originalError: errorMessage,
+            saveError: getErrorMessage(saveError),
+          }
+        );
+      }
+    } else {
+      console.error(
+        "No planner task ID is available; the error cannot be attached to a planner_runs row.",
+        errorMessage
+      );
+    }
+
+    // Mark the application as failed.
     try {
-      await updateApplicationStatus(
-        application.id,
+      await updateApplicationPlannerStatus(
+        applicationId,
         "failed",
         env
       );
     } catch (statusError) {
       console.error(
-        "Could not update application failure status:",
-        statusError.message
+        "Could not update applications.planner_status:",
+        getErrorMessage(statusError)
       );
     }
 
-    throw new Error(
-      `Initial planner task ${initialTask.id} was created ` +
-      `with status Completed, but niche discovery failed: ` +
-      error.message
-    );
+    // Return the original failure to the caller.
+    throw new Error(errorMessage);
   }
-      }
+            }
