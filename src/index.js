@@ -13,6 +13,7 @@
  *
  * REQUIRED SECRETS: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SARVAM_API_KEY
  * OPTIONAL: SARVAM_MODEL (default sarvam-105b)
+ * OPTIONAL: SARVAM_REASONING (none by default; low | high | max)
  * ============================================================
  */
 
@@ -418,12 +419,36 @@ RULES:
 - Do not include audiences with no plausible need for the company's offering.
 - Rank from highest to lowest purchase intent.
 - buying_intention must be a positive integer. Scores need not total 100.
-- Keep thinking short. Output ONLY the JSON object, no explanation.
+- Output ONLY the JSON object, no explanation.
 
 Required JSON structure:
 {"niches":[{"niche_name":"SaaS founders","buying_intention":20}]}
 
 The niches array must contain exactly 10 objects.`;
+
+// Reasoning is what made sarvam-105b take 20s+. Finding 10 customer
+// segments does not need it, so it is OFF by default
+// (reasoning_effort: null, per Sarvam's docs). Optionally set the
+// SARVAM_REASONING secret to "low", "high" or "max" to turn it back on.
+// JSON mode guarantees syntactically valid JSON.
+function buildSarvamBody(env, userPrompt) {
+  const effort = String(env.SARVAM_REASONING || "none").trim().toLowerCase();
+  const reasoningOn = ["low", "high", "max"].includes(effort);
+
+  return {
+    model: env.SARVAM_MODEL || DEFAULT_MODEL,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userPrompt },
+    ],
+    temperature: 0.2,
+    reasoning_effort: reasoningOn ? effort : null,
+    response_format: { type: "json_object" },
+    // 10 niches is only a few hundred tokens; extra room only when
+    // reasoning is on (its trace counts as completion tokens).
+    max_tokens: reasoningOn ? 6000 : 1500,
+  };
+}
 
 async function callSarvamOnce(companySummary, env, attempt, timeoutMs) {
   const userPrompt =
@@ -446,17 +471,7 @@ async function callSarvamOnce(companySummary, env, attempt, timeoutMs) {
         "api-subscription-key": env.SARVAM_API_KEY,
         Authorization: `Bearer ${env.SARVAM_API_KEY}`,
       },
-      body: JSON.stringify({
-        model: env.SARVAM_MODEL || DEFAULT_MODEL,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0.2,
-        // Reasoning models spend tokens on <think> first. 4096 could be
-        // used up before any JSON was written, so allow much more.
-        max_tokens: 8192,
-      }),
+      body: JSON.stringify(buildSarvamBody(env, userPrompt)),
       signal: controller.signal,
     });
 
@@ -493,8 +508,8 @@ async function callSarvamOnce(companySummary, env, attempt, timeoutMs) {
     if (error.name === "AbortError") {
       throw new Error(
         `Sarvam AI timed out after ${Math.round(timeoutMs / 1000)}s. ` +
-          "The model is too slow for the time limit; set the SARVAM_MODEL " +
-          "secret to a faster Sarvam model."
+          "If SARVAM_REASONING is set to low/high/max, remove that secret " +
+          "to keep reasoning off; otherwise check Sarvam API status."
       );
     }
     throw error;
