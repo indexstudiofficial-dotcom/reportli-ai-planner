@@ -1,7 +1,7 @@
 /**
  * ============================================================
  * LEAD RESEARCH PLANNER — NICHE FINDER WORKER
- * Version: 6.1.0
+ * Version: 6.2.0
  * ============================================================
  * Flow:
  * 1. Receive application from Supabase webhook (INSERT only).
@@ -16,15 +16,18 @@
  * ============================================================
  */
 
-const VERSION = "6.1.0";
+const VERSION = "6.2.0";
 const SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions";
 const DEFAULT_MODEL = "sarvam-105b";
 const INITIAL_TASK = "Analyze the company and find 10 customer niches";
 const NICHE_WORKER_TYPE = "niche_finder";
 const NICHE_SOURCE = "niche_finder";
 
-const SUPABASE_TIMEOUT_MS = 25000;
-const SARVAM_TIMEOUT_MS = 28000;
+const SUPABASE_TIMEOUT_MS = 8000;
+const BACKGROUND_BUDGET_MS = 27000; // waitUntil is cut off at ~30s
+const TEST_BUDGET_MS = 120000; // /test runs synchronously
+const SAVE_RESERVE_MS = 4000; // time kept free to save results/errors
+const MIN_ATTEMPT_MS = 8000;
 const SARVAM_MAX_ATTEMPTS = 2;
 
 // ============================================================
@@ -32,6 +35,15 @@ const SARVAM_MAX_ATTEMPTS = 2;
 // ============================================================
 
 export default {
+  // Optional Cron Trigger (e.g. every 5 minutes) to un-stick applications.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      recoverStuckApplications(env).catch((e) =>
+        console.error("Recovery failed:", e.message)
+      )
+    );
+  },
+
   async fetch(request, env, ctx) {
     const cors = {
       "Access-Control-Allow-Origin": "*",
@@ -91,7 +103,9 @@ export default {
         // Respond immediately (Supabase webhooks time out quickly),
         // and keep working in the background.
         ctx.waitUntil(
-          processApplication(String(applicationId), env).catch((e) =>
+          processApplication(String(applicationId), env, {
+            budgetMs: BACKGROUND_BUDGET_MS,
+          }).catch((e) =>
             console.error("Background processing failed:", e.message)
           )
         );
@@ -106,6 +120,11 @@ export default {
           202,
           cors
         );
+      }
+
+      if (request.method === "POST" && path === "/recover") {
+        const recovered = await recoverStuckApplications(env);
+        return jsonResponse({ success: true, recovered }, 200, cors);
       }
 
       // Synchronous route: returns the real error. Use this to debug.
@@ -123,7 +142,7 @@ export default {
         const result = await processApplication(
           String(body.application_id),
           env,
-          { force: body.force === true }
+          { force: body.force === true, budgetMs: TEST_BUDGET_MS }
         );
 
         return jsonResponse(result, 200, cors);
@@ -133,7 +152,12 @@ export default {
         {
           success: false,
           error: "Route not found",
-          available_routes: ["GET /health", "POST /webhook", "POST /test"],
+          available_routes: [
+            "GET /health",
+            "POST /webhook",
+            "POST /test",
+            "POST /recover",
+          ],
         },
         404,
         cors
@@ -320,23 +344,6 @@ async function createInitialPlannerTask(application, env) {
   return rows[0];
 }
 
-async function recordPlannerError(taskId, message, env) {
-  if (!taskId) return;
-
-  try {
-    const query = new URLSearchParams({ id: `eq.${taskId}` }).toString();
-
-    await supabaseRequest(env, "planner_runs", {
-      method: "PATCH",
-      query,
-      body: { error: String(message).slice(0, 2000) },
-      prefer: "return=minimal",
-    });
-  } catch (e) {
-    console.warn("Could not record planner error:", e.message);
-  }
-}
-
 // ============================================================
 // COMPANY CONTEXT
 // ============================================================
@@ -418,7 +425,7 @@ Required JSON structure:
 
 The niches array must contain exactly 10 objects.`;
 
-async function callSarvamOnce(companySummary, env, attempt) {
+async function callSarvamOnce(companySummary, env, attempt, timeoutMs) {
   const userPrompt =
     `Analyze this company and find 10 customer niches.\n\n` +
     `COMPANY INFORMATION:\n${companySummary}\n\n` +
@@ -429,7 +436,7 @@ async function callSarvamOnce(companySummary, env, attempt) {
       : "");
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), SARVAM_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(SARVAM_URL, {
@@ -484,7 +491,11 @@ async function callSarvamOnce(companySummary, env, attempt) {
     return parseModelJson(content);
   } catch (error) {
     if (error.name === "AbortError") {
-      throw new Error("Sarvam AI request timed out");
+      throw new Error(
+        `Sarvam AI timed out after ${Math.round(timeoutMs / 1000)}s. ` +
+          "The model is too slow for the time limit; set the SARVAM_MODEL " +
+          "secret to a faster Sarvam model."
+      );
     }
     throw error;
   } finally {
@@ -492,13 +503,28 @@ async function callSarvamOnce(companySummary, env, attempt) {
   }
 }
 
-// Calls Sarvam and validates the niches. Retries once if unusable.
-async function getNichesFromSarvam(companySummary, env) {
-  let lastError;
+// Calls Sarvam and validates the niches. Retries only if time remains.
+async function getNichesFromSarvam(companySummary, env, deadline) {
+  let lastError = null;
+  let attempts = 0;
 
   for (let attempt = 1; attempt <= SARVAM_MAX_ATTEMPTS; attempt++) {
+    const remaining = deadline - Date.now() - SAVE_RESERVE_MS;
+
+    if (remaining < MIN_ATTEMPT_MS) {
+      if (lastError) break;
+      throw new Error("Not enough time left to call Sarvam AI");
+    }
+
+    attempts++;
+
     try {
-      const output = await callSarvamOnce(companySummary, env, attempt);
+      const output = await callSarvamOnce(
+        companySummary,
+        env,
+        attempt,
+        remaining
+      );
       return normalizeNiches(output);
     } catch (error) {
       lastError = error;
@@ -506,7 +532,9 @@ async function getNichesFromSarvam(companySummary, env) {
     }
   }
 
-  throw lastError;
+  throw new Error(
+    `Sarvam failed after ${attempts} attempt(s): ${lastError?.message}`
+  );
 }
 
 // ============================================================
@@ -725,51 +753,180 @@ async function saveNiches(application, niches, env) {
 }
 
 // ============================================================
+// FAILURE RECORDING
+// Every failure is written to planner_runs.error.
+// ============================================================
+
+async function markTaskStarted(taskId, env) {
+  try {
+    const query = new URLSearchParams({ id: `eq.${taskId}` }).toString();
+
+    await supabaseRequest(env, "planner_runs", {
+      method: "PATCH",
+      query,
+      body: { started_at: new Date().toISOString(), error: null },
+      prefer: "return=minimal",
+    });
+  } catch (e) {
+    console.warn("Could not mark task started:", e.message);
+  }
+}
+
+async function saveFailure(applicationId, taskId, message, env) {
+  const stamped =
+    `[${new Date().toISOString()}] ` +
+    String(message || "Unknown error").slice(0, 1900);
+
+  try {
+    let id = taskId;
+
+    if (!id) {
+      const query = new URLSearchParams({
+        select: "id",
+        application_id: `eq.${applicationId}`,
+        worker_type: `eq.${NICHE_WORKER_TYPE}`,
+        order: "created_at.desc",
+        limit: "1",
+      }).toString();
+
+      const rows = await supabaseRequest(env, "planner_runs", { query });
+      if (Array.isArray(rows) && rows.length > 0) id = rows[0].id;
+    }
+
+    if (id) {
+      const query = new URLSearchParams({ id: `eq.${id}` }).toString();
+
+      await supabaseRequest(env, "planner_runs", {
+        method: "PATCH",
+        query,
+        body: { error: stamped },
+        prefer: "return=minimal",
+      });
+      return;
+    }
+
+    // No task exists yet (e.g. application lookup failed): create one.
+    await supabaseRequest(env, "planner_runs", {
+      method: "POST",
+      body: {
+        application_id: String(applicationId),
+        user_id: null,
+        worker_type: NICHE_WORKER_TYPE,
+        source: NICHE_SOURCE,
+        task: INITIAL_TASK,
+        pending_count: 0,
+        error: stamped,
+        niche: null,
+        status: "Failed",
+        created_at: new Date().toISOString(),
+      },
+      prefer: "return=minimal",
+    });
+  } catch (e) {
+    console.error("Could not save error to planner_runs:", e.message);
+  }
+}
+
+// ============================================================
+// RECOVERY: applications left on "processing" because the
+// worker was stopped by Cloudflare before it could finish.
+// Call POST /recover, or add a Cron Trigger (every 5 minutes).
+// ============================================================
+
+async function recoverStuckApplications(env, staleMinutes = 3) {
+  const staleMs = staleMinutes * 60 * 1000;
+
+  const apps = await supabaseRequest(env, "applications", {
+    query: new URLSearchParams({
+      select: "id",
+      planner_status: "eq.processing",
+      limit: "50",
+    }).toString(),
+  });
+
+  const recovered = [];
+
+  for (const app of Array.isArray(apps) ? apps : []) {
+    const rows = await supabaseRequest(env, "planner_runs", {
+      query: new URLSearchParams({
+        select: "id,started_at,created_at",
+        application_id: `eq.${app.id}`,
+        worker_type: `eq.${NICHE_WORKER_TYPE}`,
+        order: "created_at.desc",
+        limit: "1",
+      }).toString(),
+    });
+
+    const task = Array.isArray(rows) && rows[0] ? rows[0] : null;
+    const reference = Date.parse(task?.started_at || task?.created_at || "");
+
+    if (task && Number.isFinite(reference) && Date.now() - reference < staleMs) {
+      continue; // still legitimately running
+    }
+
+    await saveFailure(
+      app.id,
+      task?.id,
+      "Processing timed out: the worker was stopped before it finished " +
+        "(Cloudflare time limit or Sarvam too slow). Retry the application.",
+      env
+    );
+
+    await updateApplicationStatus(app.id, "failed", env);
+    recovered.push(app.id);
+  }
+
+  return recovered;
+}
+
+// ============================================================
 // MAIN PROCESS
 // ============================================================
 
 async function processApplication(applicationId, env, opts = {}) {
-  const { force = false } = opts;
+  const { force = false, budgetMs = BACKGROUND_BUDGET_MS } = opts;
+  const deadline = Date.now() + budgetMs;
 
-  console.log("Starting niche discovery for application:", applicationId);
-
-  const application = await getApplication(applicationId, env);
-
-  const initialTask = await createInitialPlannerTask(application, env);
-
-  const existingNiches = await getExistingNiches(application.id, env);
-
-  if (existingNiches.length >= 10 && !force) {
-    await updateApplicationStatus(application.id, "completed", env);
-
-    return {
-      success: true,
-      message: "Niches already exist; no duplicates inserted",
-      application_id: application.id,
-      planner_task_id: initialTask.id,
-      niche_count: existingNiches.length,
-      niches: existingNiches,
-    };
-  }
+  let taskId = null;
+  let application = null;
 
   try {
+    application = await getApplication(applicationId, env);
+
+    const initialTask = await createInitialPlannerTask(application, env);
+    taskId = initialTask.id;
+
+    await markTaskStarted(taskId, env); // also clears any old error
+
+    const existingNiches = await getExistingNiches(application.id, env);
+
+    if (existingNiches.length >= 10 && !force) {
+      await updateApplicationStatus(application.id, "completed", env);
+
+      return {
+        success: true,
+        message: "Niches already exist; no duplicates inserted",
+        application_id: application.id,
+        planner_task_id: taskId,
+        niche_count: existingNiches.length,
+        niches: existingNiches,
+      };
+    }
+
     await updateApplicationStatus(application.id, "processing", env);
 
     const businessData = await getBusinessData(application.id, env);
     const companySummary = buildCompanySummary(application, businessData);
 
-    const niches = await getNichesFromSarvam(companySummary, env);
+    const niches = await getNichesFromSarvam(companySummary, env, deadline);
 
-    // Partial leftovers (1-9 rows from an earlier failed run) would
-    // otherwise create duplicates, so clear them first.
+    // Clear partial leftovers from earlier failed runs.
     if (existingNiches.length > 0) {
-      const delQuery = new URLSearchParams({
-        application_id: `eq.${application.id}`,
-      }).toString();
-
       await supabaseRequest(env, "customer_niches", {
         method: "DELETE",
-        query: delQuery,
+        query: new URLSearchParams({
+          application_id: `eq.${application.id}`,
+        }).toString(),
         prefer: "return=minimal",
       });
     }
@@ -782,7 +939,7 @@ async function processApplication(applicationId, env, opts = {}) {
       success: true,
       message: "Customer niche discovery completed",
       application_id: application.id,
-      planner_task_id: initialTask.id,
+      planner_task_id: taskId,
       planner_task_status: "Completed",
       niche_count: savedNiches.length,
       buying_intention_total: savedNiches.reduce(
@@ -794,19 +951,20 @@ async function processApplication(applicationId, env, opts = {}) {
   } catch (error) {
     console.error("Niche discovery failed:", error.message);
 
-    await recordPlannerError(initialTask.id, error.message, env);
+    // 1. Save the error in planner_runs.error
+    await saveFailure(applicationId, taskId, error.message, env);
 
-    try {
-      await updateApplicationStatus(application.id, "failed", env);
-    } catch (statusError) {
-      console.error(
-        "Could not update application failure status:",
-        statusError.message
-      );
+    // 2. Never leave the application on "processing"
+    if (application) {
+      try {
+        await updateApplicationStatus(application.id, "failed", env);
+      } catch (statusError) {
+        console.error("Could not set failed status:", statusError.message);
+      }
     }
 
     throw new Error(
-      `Niche discovery failed (planner task ${initialTask.id}): ${error.message}`
+      `Niche discovery failed (planner task ${taskId || "none"}): ${error.message}`
     );
   }
 }
